@@ -2,11 +2,18 @@
 
 [nvenc-6.8.3.patch](nvenc-6.8.3.patch) adds NVIDIA hardware H.264 encoding
 to KPipeWire 6.8.3 via FFmpeg's `h264_nvenc`. It also fixes frame pacing
-when capture timestamps are rounded to milliseconds. Capture, pacing, and
-the encoder use the configured maximum frame rate from startup.
+when capture timestamps are rounded to milliseconds, fixes lost
+condition-variable wakeups in `PipeWireProduce` worker threads, and
+propagates the configured maximum frame rate from startup.
 
-The encoder still converts frames to YUV420P in system memory. For DMA-BUF
-capture, this means a GPU readback before FFmpeg uploads frames to NVENC.
+When a CUDA-capable NVIDIA EGL/GBM render node is available, DMA-BUF
+frames stay on the GPU: they are imported via `EGLImage`, converted to
+BT.709 NV12 (full or limited range, padded to even dimensions) in OpenGL,
+copied VRAM-to-VRAM into pooled `AV_PIX_FMT_CUDA` surfaces via CUDA-GL
+interop (`libcuda.so.1` loaded dynamically at runtime), and encoded
+directly by `h264_nvenc` with zero PCIe round-trip or CPU `swscale`. If
+GPU interop is unavailable (or `KPIPEWIRE_NVENC_NO_ZEROCOPY=1` is set),
+it falls back to a pooled single-pass NV12 software upload path.
 
 ## Build and install
 

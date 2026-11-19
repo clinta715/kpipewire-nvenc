@@ -1,14 +1,22 @@
 Add NVIDIA NVENC (h264_nvenc) H264 encoder for KPipeWire 6.8.3
 
 On NVIDIA the VAAPI driver is decode-only, so H264VAAPIEncoder cannot
-encode and KPipeWire falls back to CPU libx264. Add H264NvencEncoder, a
-SoftwareEncoder subclass that converts frames to yuv420p and hands them
-to FFmpeg's h264_nvenc, which uploads and encodes in hardware.
+encode and KPipeWire falls back to CPU libx264. Add H264NvencEncoder,
+which uses a zero-copy GPU pipeline when an NVIDIA EGL/CUDA render node
+is available: DMA-BUF frames are imported via EGLImage, converted to
+BT.709 NV12 (full or limited range, padded to even dimensions) in OpenGL,
+copied VRAM-to-VRAM into a pooled AV_PIX_FMT_CUDA frame via CUDA-GL
+interop (libcuda.so.1 loaded dynamically), and encoded directly by
+h264_nvenc with zero PCIe round-trip or CPU swscale.
 
-Uses the 6.8.3 encoder API: options are emitted through
-buildEncodingOptions(), and the filter graph is built in initialize()
-because setColorRange() runs after construction. NVENC-valid presets
-(p1..p7, tune hq/ll) replace the libx264 ones, which h264_nvenc rejects.
+Falls back cleanly to a pooled single-pass NV12 software path when GPU
+interop is unavailable (or KPIPEWIRE_NVENC_NO_ZEROCOPY=1 is set).
+
+Also configures h264_nvenc with explicit profile, zero-latency options
+(zerolatency=1, delay=0, multipass=disabled, surfaces=8) for Speed and
+NoPreference, fixes sub-millisecond frame pacing in PipeWireProduce, and
+fixes lost condition-variable wakeups in PipeWireProduce worker threads.
+
 Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 
 --- a/src/CMakeLists.txt
@@ -21,6 +29,1330 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
                              libx264encoder.cpp
                              libopenh264encoder.cpp
                              libvpxencoder.cpp
+--- a/src/h264nvencencoder.cpp
++++ b/src/h264nvencencoder.cpp
+@@ -0,0 +1,1265 @@
++/*
++    SPDX-FileCopyrightText: 2026 Local patch
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "h264nvencencoder_p.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <QByteArray>
++#include <QImage>
++#include <QList>
++#include <QSize>
++#include <QVarLengthArray>
++
++#include <epoxy/egl.h>
++#include <epoxy/gl.h>
++#include <gbm.h>
++#include <libdrm/drm_fourcc.h>
++#include <xf86drm.h>
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavfilter/buffersrc.h>
++#include <libavutil/buffer.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/imgutils.h>
++#include <libavutil/pixfmt.h>
++}
++
++#include "logging_record.h"
++
++#ifndef AV_PROFILE_H264_BASELINE // ffmpeg before 8.0
++#define AV_PROFILE_H264_BASELINE FF_PROFILE_H264_BASELINE
++#define AV_PROFILE_H264_MAIN FF_PROFILE_H264_MAIN
++#define AV_PROFILE_H264_HIGH FF_PROFILE_H264_HIGH
++#endif
++
++using namespace Qt::StringLiterals;
++
++namespace
++{
++
++// Minimal CUDA driver API declarations loaded dynamically from libcuda.so.1
++// so building KPipeWire requires no CUDA toolkit headers.
++using CUresult = int;
++using CUcontext = struct CUctx_st *;
++using CUstream = struct CUstream_st *;
++using CUarray = struct CUarray_st *;
++using CUgraphicsResource = struct CUgraphicsResource_st *;
++using CUdeviceptr = uint64_t;
++
++constexpr CUresult kCudaSuccess = 0;
++constexpr unsigned int kCuGraphicsRegisterFlagsReadOnly = 1;
++constexpr int kCuMemoryTypeDevice = 2;
++constexpr int kCuMemoryTypeArray = 3;
++constexpr int kCuGlDeviceListAll = 1;
++constexpr int kAvCudaUsePrimaryContext = (1 << 0);
++
++struct CudaMemcpy2D {
++    size_t srcXInBytes = 0;
++    size_t srcY = 0;
++    int srcMemoryType = 0;
++    const void *srcHost = nullptr;
++    CUdeviceptr srcDevice = 0;
++    CUarray srcArray = nullptr;
++    size_t srcPitch = 0;
++
++    size_t dstXInBytes = 0;
++    size_t dstY = 0;
++    int dstMemoryType = 0;
++    void *dstHost = nullptr;
++    CUdeviceptr dstDevice = 0;
++    CUarray dstArray = nullptr;
++    size_t dstPitch = 0;
++
++    size_t WidthInBytes = 0;
++    size_t Height = 0;
++};
++
++// Mirrors FFmpeg's AVCUDADeviceContext from <libavutil/hwcontext_cuda.h>.
++struct AvCudaDeviceContext {
++    CUcontext cuda_ctx;
++    CUstream stream;
++    void *internal;
++};
++
++struct CudaApi {
++    using cuCtxPushCurrent_t = CUresult (*)(CUcontext);
++    using cuCtxPopCurrent_t = CUresult (*)(CUcontext *);
++    using cuGLGetDevices_t = CUresult (*)(unsigned int *, int *, unsigned int, int);
++    using cuGraphicsGLRegisterImage_t = CUresult (*)(CUgraphicsResource *, GLuint, GLenum, unsigned int);
++    using cuGraphicsMapResources_t = CUresult (*)(unsigned int, CUgraphicsResource *, CUstream);
++    using cuGraphicsUnmapResources_t = CUresult (*)(unsigned int, CUgraphicsResource *, CUstream);
++    using cuGraphicsSubResourceGetMappedArray_t = CUresult (*)(CUarray *, CUgraphicsResource, unsigned int, unsigned int);
++    using cuGraphicsUnregisterResource_t = CUresult (*)(CUgraphicsResource);
++    using cuMemcpy2DAsync_t = CUresult (*)(const CudaMemcpy2D *, CUstream);
++
++    cuCtxPushCurrent_t ctxPushCurrent = nullptr;
++    cuCtxPopCurrent_t ctxPopCurrent = nullptr;
++    cuGLGetDevices_t glGetDevices = nullptr;
++    cuGraphicsGLRegisterImage_t graphicsGLRegisterImage = nullptr;
++    cuGraphicsMapResources_t graphicsMapResources = nullptr;
++    cuGraphicsUnmapResources_t graphicsUnmapResources = nullptr;
++    cuGraphicsSubResourceGetMappedArray_t graphicsSubResourceGetMappedArray = nullptr;
++    cuGraphicsUnregisterResource_t graphicsUnregisterResource = nullptr;
++    cuMemcpy2DAsync_t memcpy2DAsync = nullptr;
++    bool loaded = false;
++
++    static const CudaApi &instance()
++    {
++        static CudaApi api = []() {
++            CudaApi out;
++            void *lib = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
++            if (!lib) {
++                return out;
++            }
++            out.ctxPushCurrent = reinterpret_cast<cuCtxPushCurrent_t>(dlsym(lib, "cuCtxPushCurrent_v2"));
++            out.ctxPopCurrent = reinterpret_cast<cuCtxPopCurrent_t>(dlsym(lib, "cuCtxPopCurrent_v2"));
++            out.glGetDevices = reinterpret_cast<cuGLGetDevices_t>(dlsym(lib, "cuGLGetDevices_v2"));
++            out.graphicsGLRegisterImage = reinterpret_cast<cuGraphicsGLRegisterImage_t>(dlsym(lib, "cuGraphicsGLRegisterImage"));
++            out.graphicsMapResources = reinterpret_cast<cuGraphicsMapResources_t>(dlsym(lib, "cuGraphicsMapResources"));
++            out.graphicsUnmapResources = reinterpret_cast<cuGraphicsUnmapResources_t>(dlsym(lib, "cuGraphicsUnmapResources"));
++            out.graphicsSubResourceGetMappedArray =
++                reinterpret_cast<cuGraphicsSubResourceGetMappedArray_t>(dlsym(lib, "cuGraphicsSubResourceGetMappedArray"));
++            out.graphicsUnregisterResource = reinterpret_cast<cuGraphicsUnregisterResource_t>(dlsym(lib, "cuGraphicsUnregisterResource"));
++            out.memcpy2DAsync = reinterpret_cast<cuMemcpy2DAsync_t>(dlsym(lib, "cuMemcpy2DAsync_v2"));
++            out.loaded = out.ctxPushCurrent && out.ctxPopCurrent && out.glGetDevices && out.graphicsGLRegisterImage
++                && out.graphicsMapResources && out.graphicsUnmapResources && out.graphicsSubResourceGetMappedArray
++                && out.graphicsUnregisterResource && out.memcpy2DAsync;
++            return out;
++        }();
++        return api;
++    }
++};
++
++constexpr const char *kVertexShaderSrc = R"GLSL(
++#version 330 core
++void main()
++{
++    vec2 pos = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
++                    (gl_VertexID == 2) ? 3.0 : -1.0);
++    gl_Position = vec4(pos, 0.0, 1.0);
++}
++)GLSL";
++
++// ITU-R BT.709 RGB -> Y (full or limited range) with black padding for odd dimensions.
++constexpr const char *kFragYSrc = R"GLSL(
++#version 330 core
++uniform sampler2D uSrc;
++uniform ivec2 uSrcSize;
++uniform int uFullRange;
++out float outY;
++void main()
++{
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    if (p.x >= uSrcSize.x || p.y >= uSrcSize.y) {
++        outY = (uFullRange != 0) ? 0.0 : (16.0 / 255.0);
++        return;
++    }
++    vec3 rgb = texelFetch(uSrc, p, 0).rgb;
++    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
++    outY = (uFullRange != 0) ? y : (16.0 / 255.0 + (219.0 / 255.0) * y);
++}
++)GLSL";
++
++// ITU-R BT.709 RGB -> interleaved UV (NV12 chroma plane, 2x2 box filter).
++constexpr const char *kFragUVSrc = R"GLSL(
++#version 330 core
++uniform sampler2D uSrc;
++uniform ivec2 uSrcSize;
++uniform int uFullRange;
++out vec2 outUV;
++vec3 samplePadded(ivec2 p)
++{
++    if (p.x >= uSrcSize.x || p.y >= uSrcSize.y) {
++        return vec3(0.0);
++    }
++    return texelFetch(uSrc, p, 0).rgb;
++}
++void main()
++{
++    ivec2 b = ivec2(gl_FragCoord.xy) * 2;
++    vec3 rgb = 0.25 * (samplePadded(b)
++                     + samplePadded(b + ivec2(1, 0))
++                     + samplePadded(b + ivec2(0, 1))
++                     + samplePadded(b + ivec2(1, 1)));
++    float u = dot(rgb, vec3(-0.114572, -0.385428, 0.5));
++    float v = dot(rgb, vec3(0.5, -0.454153, -0.045847));
++    if (uFullRange != 0) {
++        outUV = vec2(u + 0.5, v + 0.5);
++    } else {
++        outUV = vec2(128.0 / 255.0 + (224.0 / 255.0) * u,
++                     128.0 / 255.0 + (224.0 / 255.0) * v);
++    }
++}
++)GLSL";
++
++GLuint compileShader(GLenum type, const char *source)
++{
++    GLuint shader = glCreateShader(type);
++    if (!shader) {
++        return 0;
++    }
++    glShaderSource(shader, 1, &source, nullptr);
++    glCompileShader(shader);
++    GLint ok = GL_FALSE;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (ok != GL_TRUE) {
++        char log[512] = {};
++        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC GLSL compile failed:" << log;
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++GLuint linkProgram(const char *vertSrc, const char *fragSrc)
++{
++    GLuint vs = compileShader(GL_VERTEX_SHADER, vertSrc);
++    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragSrc);
++    if (!vs || !fs) {
++        if (vs) {
++            glDeleteShader(vs);
++        }
++        if (fs) {
++            glDeleteShader(fs);
++        }
++        return 0;
++    }
++
++    GLuint prog = glCreateProgram();
++    glAttachShader(prog, vs);
++    glAttachShader(prog, fs);
++    glLinkProgram(prog);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++
++    GLint ok = GL_FALSE;
++    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
++    if (ok != GL_TRUE) {
++        char log[512] = {};
++        glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC GLSL link failed:" << log;
++        glDeleteProgram(prog);
++        return 0;
++    }
++    return prog;
++}
++
++// Return DRM render nodes with NVIDIA PCI devices prioritized first.
++QList<QByteArray> findCandidateRenderNodes()
++{
++    QList<QByteArray> nvidiaNodes;
++    QList<QByteArray> otherNodes;
++
++    const int maxDevices = drmGetDevices2(0, nullptr, 0);
++    if (maxDevices <= 0) {
++        return {};
++    }
++
++    std::vector<drmDevicePtr> devices(static_cast<size_t>(maxDevices));
++    const int count = drmGetDevices2(0, devices.data(), maxDevices);
++    if (count <= 0) {
++        return {};
++    }
++
++    for (int i = 0; i < count; ++i) {
++        const drmDevicePtr dev = devices[static_cast<size_t>(i)];
++        if (!(dev->available_nodes & (1 << DRM_NODE_RENDER)) || !dev->nodes[DRM_NODE_RENDER]) {
++            continue;
++        }
++        QByteArray path(dev->nodes[DRM_NODE_RENDER]);
++        if (dev->bustype == DRM_BUS_PCI && dev->deviceinfo.pci && dev->deviceinfo.pci->vendor_id == 0x10de) {
++            nvidiaNodes.append(path);
++        } else {
++            otherNodes.append(path);
++        }
++    }
++
++    drmFreeDevices(devices.data(), count);
++    nvidiaNodes.append(otherNodes);
++    return nvidiaNodes;
++}
++
++} // namespace
++
++struct H264NvencEncoder::GpuState {
++    int drmFd = -1;
++    gbm_device *gbmDevice = nullptr;
++    EGLDisplay eglDisplay = EGL_NO_DISPLAY;
++    EGLContext eglContext = EGL_NO_CONTEXT;
++    bool hasDmaBufImport = false;
++    bool hasDmaBufModifiers = false;
++    bool directDmaBufFailed = false;
++
++    GLuint vao = 0;
++    GLuint progY = 0;
++    GLuint progUV = 0;
++    GLint yLocSrc = -1;
++    GLint yLocSrcSize = -1;
++    GLint yLocFullRange = -1;
++    GLint uvLocSrc = -1;
++    GLint uvLocSrcSize = -1;
++    GLint uvLocFullRange = -1;
++
++    GLuint srcTex = 0;
++    GLuint shmTex = 0;
++    GLuint yTex = 0;
++    GLuint uvTex = 0;
++    GLuint fboY = 0;
++    GLuint fboUV = 0;
++    bool shmTexAllocated = false;
++
++    AVBufferRef *cudaDeviceCtx = nullptr;
++    AVBufferRef *cudaFramesCtx = nullptr;
++    CUgraphicsResource yCudaRes = nullptr;
++    CUgraphicsResource uvCudaRes = nullptr;
++
++    QSize srcSize;
++    QSize codedSize;
++    QImage fallbackImage;
++
++    std::mutex queueMutex;
++    std::deque<AVFrame *> frameQueue;
++};
++
++H264NvencEncoder::H264NvencEncoder(H264Profile profile, PipeWireProduce *produce)
++    : SoftwareEncoder(produce)
++    , m_profile(profile)
++{
++}
++
++H264NvencEncoder::~H264NvencEncoder()
++{
++    // Close the codec context before tearing down CUDA/EGL so NVENC releases
++    // its references to our hardware frames context first.
++    if (m_avCodecContext) {
++        avcodec_free_context(&m_avCodecContext);
++    }
++
++    cleanupGpuPath();
++
++    if (m_swBufferPool) {
++        av_buffer_pool_uninit(&m_swBufferPool);
++    }
++}
++
++void H264NvencEncoder::cleanupGpuPath()
++{
++    if (!m_gpu) {
++        return;
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(m_gpu->queueMutex);
++        while (!m_gpu->frameQueue.empty()) {
++            AVFrame *frame = m_gpu->frameQueue.front();
++            m_gpu->frameQueue.pop_front();
++            av_frame_free(&frame);
++        }
++    }
++
++    const auto &cuda = CudaApi::instance();
++    const bool haveContext = (m_gpu->eglDisplay != EGL_NO_DISPLAY && m_gpu->eglContext != EGL_NO_CONTEXT);
++    const bool madeCurrent = haveContext && eglMakeCurrent(m_gpu->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_gpu->eglContext);
++
++    if (m_gpu->cudaDeviceCtx && cuda.loaded && (m_gpu->yCudaRes || m_gpu->uvCudaRes)) {
++        auto *devCtx = reinterpret_cast<AVHWDeviceContext *>(m_gpu->cudaDeviceCtx->data);
++        auto *cuCtx = reinterpret_cast<AvCudaDeviceContext *>(devCtx->hwctx);
++        if (cuda.ctxPushCurrent(cuCtx->cuda_ctx) == kCudaSuccess) {
++            if (m_gpu->yCudaRes) {
++                cuda.graphicsUnregisterResource(m_gpu->yCudaRes);
++                m_gpu->yCudaRes = nullptr;
++            }
++            if (m_gpu->uvCudaRes) {
++                cuda.graphicsUnregisterResource(m_gpu->uvCudaRes);
++                m_gpu->uvCudaRes = nullptr;
++            }
++            CUcontext popped = nullptr;
++            cuda.ctxPopCurrent(&popped);
++        }
++    }
++
++    if (madeCurrent) {
++        if (m_gpu->fboY) {
++            glDeleteFramebuffers(1, &m_gpu->fboY);
++        }
++        if (m_gpu->fboUV) {
++            glDeleteFramebuffers(1, &m_gpu->fboUV);
++        }
++        if (m_gpu->srcTex) {
++            glDeleteTextures(1, &m_gpu->srcTex);
++        }
++        if (m_gpu->shmTex) {
++            glDeleteTextures(1, &m_gpu->shmTex);
++        }
++        if (m_gpu->yTex) {
++            glDeleteTextures(1, &m_gpu->yTex);
++        }
++        if (m_gpu->uvTex) {
++            glDeleteTextures(1, &m_gpu->uvTex);
++        }
++        if (m_gpu->progY) {
++            glDeleteProgram(m_gpu->progY);
++        }
++        if (m_gpu->progUV) {
++            glDeleteProgram(m_gpu->progUV);
++        }
++        if (m_gpu->vao) {
++            glDeleteVertexArrays(1, &m_gpu->vao);
++        }
++        eglMakeCurrent(m_gpu->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    }
++
++    if (m_gpu->eglDisplay != EGL_NO_DISPLAY) {
++        if (m_gpu->eglContext != EGL_NO_CONTEXT) {
++            eglDestroyContext(m_gpu->eglDisplay, m_gpu->eglContext);
++        }
++        eglTerminate(m_gpu->eglDisplay);
++    }
++
++    if (m_gpu->cudaFramesCtx) {
++        av_buffer_unref(&m_gpu->cudaFramesCtx);
++    }
++    if (m_gpu->cudaDeviceCtx) {
++        av_buffer_unref(&m_gpu->cudaDeviceCtx);
++    }
++    if (m_gpu->gbmDevice) {
++        gbm_device_destroy(m_gpu->gbmDevice);
++    }
++    if (m_gpu->drmFd >= 0) {
++        close(m_gpu->drmFd);
++    }
++
++    m_gpu.reset();
++}
++
++bool H264NvencEncoder::initializeGpuPath(const QSize &size)
++{
++    if (qEnvironmentVariableIntValue("KPIPEWIRE_NVENC_NO_ZEROCOPY") != 0) {
++        return false;
++    }
++
++    const auto &cuda = CudaApi::instance();
++    if (!cuda.loaded) {
++        qCDebug(PIPEWIRERECORD_LOGGING) << "NVENC zero-copy disabled: libcuda.so.1 interop symbols unavailable";
++        return false;
++    }
++
++    const QList<QByteArray> nodes = findCandidateRenderNodes();
++    if (nodes.isEmpty()) {
++        return false;
++    }
++
++    const int codedW = (size.width() + 1) & ~1;
++    const int codedH = (size.height() + 1) & ~1;
++
++    // Find a DRM render node backed by a CUDA-capable NVIDIA EGL context.
++    int cudaDeviceIndex = -1;
++    auto gpu = std::make_unique<GpuState>();
++    gpu->srcSize = size;
++    gpu->codedSize = QSize(codedW, codedH);
++
++    for (const QByteArray &nodePath : nodes) {
++        int fd = open(nodePath.constData(), O_RDWR | O_CLOEXEC);
++        if (fd < 0) {
++            continue;
++        }
++        gbm_device *gbm = gbm_create_device(fd);
++        if (!gbm) {
++            close(fd);
++            continue;
++        }
++
++        EGLDisplay dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_MESA, gbm, nullptr);
++        EGLint major = 0;
++        EGLint minor = 0;
++        if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &major, &minor)) {
++            if (dpy != EGL_NO_DISPLAY) {
++                eglTerminate(dpy);
++            }
++            gbm_device_destroy(gbm);
++            close(fd);
++            continue;
++        }
++
++        if (!eglBindAPI(EGL_OPENGL_API)) {
++            eglTerminate(dpy);
++            gbm_device_destroy(gbm);
++            close(fd);
++            continue;
++        }
++
++        static constexpr EGLint cfgAttribs[] = {
++            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++            EGL_NONE,
++        };
++        EGLConfig cfg = nullptr;
++        EGLint cfgCount = 0;
++        if (!eglChooseConfig(dpy, cfgAttribs, &cfg, 1, &cfgCount) || cfgCount < 1) {
++            eglTerminate(dpy);
++            gbm_device_destroy(gbm);
++            close(fd);
++            continue;
++        }
++
++        static constexpr EGLint ctxAttribs[] = {
++            EGL_CONTEXT_MAJOR_VERSION, 3,
++            EGL_CONTEXT_MINOR_VERSION, 3,
++            EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
++            EGL_NONE,
++        };
++        EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttribs);
++        if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
++            if (ctx != EGL_NO_CONTEXT) {
++                eglDestroyContext(dpy, ctx);
++            }
++            eglTerminate(dpy);
++            gbm_device_destroy(gbm);
++            close(fd);
++            continue;
++        }
++
++        // Create FFmpeg's CUDA device context on the GPU matching this GL context.
++        AVBufferRef *probeDev = nullptr;
++        int matchedDev = -1;
++        if (av_hwdevice_ctx_create(&probeDev, AV_HWDEVICE_TYPE_CUDA, "0", nullptr, kAvCudaUsePrimaryContext) == 0) {
++            auto *devCtx = reinterpret_cast<AVHWDeviceContext *>(probeDev->data);
++            auto *cuCtx = reinterpret_cast<AvCudaDeviceContext *>(devCtx->hwctx);
++            if (cuda.ctxPushCurrent(cuCtx->cuda_ctx) == kCudaSuccess) {
++                unsigned int glDevCount = 0;
++                int glDevs[4] = {};
++                if (cuda.glGetDevices(&glDevCount, glDevs, 4, kCuGlDeviceListAll) == kCudaSuccess && glDevCount > 0) {
++                    matchedDev = glDevs[0];
++                }
++                CUcontext popped = nullptr;
++                cuda.ctxPopCurrent(&popped);
++            }
++            if (matchedDev == 0) {
++                gpu->cudaDeviceCtx = probeDev;
++                probeDev = nullptr;
++            } else {
++                av_buffer_unref(&probeDev);
++            }
++        }
++
++        if (matchedDev < 0) {
++            eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++            eglDestroyContext(dpy, ctx);
++            eglTerminate(dpy);
++            gbm_device_destroy(gbm);
++            close(fd);
++            continue;
++        }
++
++        if (!gpu->cudaDeviceCtx) {
++            const QByteArray devId = QByteArray::number(matchedDev);
++            if (av_hwdevice_ctx_create(&gpu->cudaDeviceCtx, AV_HWDEVICE_TYPE_CUDA, devId.constData(), nullptr, kAvCudaUsePrimaryContext) < 0) {
++                eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++                eglDestroyContext(dpy, ctx);
++                eglTerminate(dpy);
++                gbm_device_destroy(gbm);
++                close(fd);
++                continue;
++            }
++        }
++
++        cudaDeviceIndex = matchedDev;
++        gpu->drmFd = fd;
++        gpu->gbmDevice = gbm;
++        gpu->eglDisplay = dpy;
++        gpu->eglContext = ctx;
++        gpu->hasDmaBufImport = epoxy_has_egl_extension(dpy, "EGL_EXT_image_dma_buf_import");
++        gpu->hasDmaBufModifiers = epoxy_has_egl_extension(dpy, "EGL_EXT_image_dma_buf_import_modifiers");
++        break;
++    }
++
++    if (cudaDeviceIndex < 0) {
++        return false;
++    }
++
++    m_gpu = std::move(gpu);
++
++    m_gpu->cudaFramesCtx = av_hwframe_ctx_alloc(m_gpu->cudaDeviceCtx);
++    if (!m_gpu->cudaFramesCtx) {
++        cleanupGpuPath();
++        return false;
++    }
++
++    auto *framesCtx = reinterpret_cast<AVHWFramesContext *>(m_gpu->cudaFramesCtx->data);
++    framesCtx->format = AV_PIX_FMT_CUDA;
++    framesCtx->sw_format = AV_PIX_FMT_NV12;
++    framesCtx->width = codedW;
++    framesCtx->height = codedH;
++    framesCtx->initial_pool_size = 8;
++
++    if (int err = av_hwframe_ctx_init(m_gpu->cudaFramesCtx); err < 0) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC failed initializing CUDA frames context:" << av_err2str(err);
++        cleanupGpuPath();
++        return false;
++    }
++
++    // Set up persistent GL objects and BT.709 RGB->NV12 shader programs.
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_STENCIL_TEST);
++    glDisable(GL_BLEND);
++    glDisable(GL_CULL_FACE);
++    glDisable(GL_SCISSOR_TEST);
++
++    glGenVertexArrays(1, &m_gpu->vao);
++    m_gpu->progY = linkProgram(kVertexShaderSrc, kFragYSrc);
++    m_gpu->progUV = linkProgram(kVertexShaderSrc, kFragUVSrc);
++    if (!m_gpu->vao || !m_gpu->progY || !m_gpu->progUV) {
++        cleanupGpuPath();
++        return false;
++    }
++
++    m_gpu->yLocSrc = glGetUniformLocation(m_gpu->progY, "uSrc");
++    m_gpu->yLocSrcSize = glGetUniformLocation(m_gpu->progY, "uSrcSize");
++    m_gpu->yLocFullRange = glGetUniformLocation(m_gpu->progY, "uFullRange");
++    m_gpu->uvLocSrc = glGetUniformLocation(m_gpu->progUV, "uSrc");
++    m_gpu->uvLocSrcSize = glGetUniformLocation(m_gpu->progUV, "uSrcSize");
++    m_gpu->uvLocFullRange = glGetUniformLocation(m_gpu->progUV, "uFullRange");
++
++    glGenTextures(1, &m_gpu->srcTex);
++    glBindTexture(GL_TEXTURE_2D, m_gpu->srcTex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++    glGenTextures(1, &m_gpu->shmTex);
++    glBindTexture(GL_TEXTURE_2D, m_gpu->shmTex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++    glGenTextures(1, &m_gpu->yTex);
++    glBindTexture(GL_TEXTURE_2D, m_gpu->yTex);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, codedW, codedH, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++
++    glGenTextures(1, &m_gpu->uvTex);
++    glBindTexture(GL_TEXTURE_2D, m_gpu->uvTex);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, codedW / 2, codedH / 2, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glBindTexture(GL_TEXTURE_2D, 0);
++
++    glGenFramebuffers(1, &m_gpu->fboY);
++    glBindFramebuffer(GL_FRAMEBUFFER, m_gpu->fboY);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_gpu->yTex, 0);
++    const bool fboYOk = (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
++
++    glGenFramebuffers(1, &m_gpu->fboUV);
++    glBindFramebuffer(GL_FRAMEBUFFER, m_gpu->fboUV);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_gpu->uvTex, 0);
++    const bool fboUVOk = (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++    if (!fboYOk || !fboUVOk) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC GL NV12 framebuffers incomplete";
++        cleanupGpuPath();
++        return false;
++    }
++
++    // Register Y and UV render-target textures once with CUDA.
++    auto *devCtx = reinterpret_cast<AVHWDeviceContext *>(m_gpu->cudaDeviceCtx->data);
++    auto *cuCtx = reinterpret_cast<AvCudaDeviceContext *>(devCtx->hwctx);
++    if (cuda.ctxPushCurrent(cuCtx->cuda_ctx) != kCudaSuccess) {
++        cleanupGpuPath();
++        return false;
++    }
++
++    const CUresult crY = cuda.graphicsGLRegisterImage(&m_gpu->yCudaRes, m_gpu->yTex, GL_TEXTURE_2D, kCuGraphicsRegisterFlagsReadOnly);
++    const CUresult crUV = cuda.graphicsGLRegisterImage(&m_gpu->uvCudaRes, m_gpu->uvTex, GL_TEXTURE_2D, kCuGraphicsRegisterFlagsReadOnly);
++
++    CUcontext popped = nullptr;
++    cuda.ctxPopCurrent(&popped);
++
++    if (crY != kCudaSuccess || crUV != kCudaSuccess) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC CUDA-GL texture registration failed:" << crY << crUV;
++        cleanupGpuPath();
++        return false;
++    }
++
++    qCInfo(PIPEWIRERECORD_LOGGING) << "H264NvencEncoder using zero-copy GPU DMA-BUF -> GL -> CUDA path on CUDA device" << cudaDeviceIndex;
++    return true;
++}
++
++bool H264NvencEncoder::initialize(const QSize &size)
++{
++    Q_ASSERT(!size.isEmpty());
++
++    auto codec = avcodec_find_encoder_by_name("h264_nvenc");
++    if (!codec) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "h264_nvenc codec not found";
++        return false;
++    }
++
++    const bool useGpu = initializeGpuPath(size);
++    if (!useGpu) {
++        // Fallback software path: single-pass BT.709 NV12 conversion (and only pad odd dimensions).
++        const auto colorRange = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? u"full"_s : u"limited"_s;
++        const bool needsPad = (size.width() & 1) || (size.height() & 1);
++        if (needsPad) {
++            m_filterGraphToParse =
++                u"scale=out_range=%1:out_color_matrix=bt709:flags=fast_bilinear,format=nv12,pad=ceil(iw/2)*2:ceil(ih/2)*2"_s.arg(colorRange);
++        } else {
++            m_filterGraphToParse = u"scale=out_range=%1:out_color_matrix=bt709:flags=fast_bilinear,format=nv12"_s.arg(colorRange);
++        }
++
++        if (!createFilterGraph(size)) {
++            return false;
++        }
++
++        m_swPoolSize = size;
++        // DmaBufHandler::downloadFrame() uses glReadPixels without GL_PACK_ROW_LENGTH,
++        // so the buffer must be tightly packed (width * 4 bytes per row).
++        const int stride = size.width() * 4;
++        m_swBufferPool = av_buffer_pool_init(static_cast<size_t>(stride) * static_cast<size_t>(size.height()), nullptr);
++    }
++
++    m_avCodecContext = avcodec_alloc_context3(codec);
++    if (!m_avCodecContext) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "Could not allocate video codec context";
++        cleanupGpuPath();
++        return false;
++    }
++
++    const int codedW = (size.width() + 1) & ~1;
++    const int codedH = (size.height() + 1) & ~1;
++    m_avCodecContext->width = codedW;
++    m_avCodecContext->height = codedH;
++    m_avCodecContext->max_b_frames = 0;
++    m_avCodecContext->gop_size = 100;
++    m_avCodecContext->time_base = AVRational{1, 1000};
++    m_avCodecContext->color_range = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++    m_avCodecContext->colorspace = AVCOL_SPC_BT709;
++    m_avCodecContext->color_primaries = AVCOL_PRI_BT709;
++    m_avCodecContext->color_trc = AVCOL_TRC_BT709;
++
++    if (useGpu) {
++        m_avCodecContext->pix_fmt = AV_PIX_FMT_CUDA;
++        m_avCodecContext->sw_pix_fmt = AV_PIX_FMT_NV12;
++        m_avCodecContext->hw_frames_ctx = av_buffer_ref(m_gpu->cudaFramesCtx);
++    } else {
++        m_avCodecContext->pix_fmt = AV_PIX_FMT_NV12;
++    }
++
++    // Without a frame rate NVENC assumes 1/time_base, i.e. 1000 fps, and signals an
++    // unreasonably high level: give it the stream's real maximum frame rate.
++    const Fraction framerate = m_produce->maxFramerate();
++    if (framerate.numerator > 0 && framerate.denominator > 0) {
++        m_avCodecContext->framerate = AVRational{int(framerate.numerator), int(framerate.denominator)};
++    }
++
++    switch (m_profile) {
++    case H264Profile::Baseline:
++        m_avCodecContext->profile = AV_PROFILE_H264_BASELINE;
++        break;
++    case H264Profile::Main:
++        m_avCodecContext->profile = AV_PROFILE_H264_MAIN;
++        break;
++    case H264Profile::High:
++        m_avCodecContext->profile = AV_PROFILE_H264_HIGH;
++        break;
++    }
++
++    AVDictionary *options = buildEncodingOptions();
++    maybeLogOptions(options);
++
++    const int result = avcodec_open2(m_avCodecContext, codec, &options);
++    av_dict_free(&options);
++    if (result < 0) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "Could not open h264_nvenc codec" << av_err2str(result);
++        avcodec_free_context(&m_avCodecContext);
++        cleanupGpuPath();
++        return false;
++    }
++
++    return true;
++}
++
++bool H264NvencEncoder::uploadImageToShmTexture(const void *data, int width, int height, int stride, spa_video_format format)
++{
++    GLenum glFormat = GL_RGBA;
++    int bpp = 4;
++
++    switch (format) {
++    case SPA_VIDEO_FORMAT_RGBA:
++    case SPA_VIDEO_FORMAT_RGBx:
++        glFormat = GL_RGBA;
++        bpp = 4;
++        break;
++    case SPA_VIDEO_FORMAT_BGRA:
++    case SPA_VIDEO_FORMAT_BGRx:
++        glFormat = GL_BGRA;
++        bpp = 4;
++        break;
++    case SPA_VIDEO_FORMAT_RGB:
++        glFormat = GL_RGB;
++        bpp = 3;
++        break;
++    case SPA_VIDEO_FORMAT_BGR:
++        glFormat = GL_BGR;
++        bpp = 3;
++        break;
++    default:
++        return false;
++    }
++
++    const int rowPixels = stride / bpp;
++    if (rowPixels < width || (stride % bpp) != 0) {
++        return false;
++    }
++
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, m_gpu->shmTex);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, (bpp == 4) ? 4 : 1);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowPixels);
++
++    if (!m_gpu->shmTexAllocated) {
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, glFormat, GL_UNSIGNED_BYTE, data);
++        m_gpu->shmTexAllocated = true;
++    } else {
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, glFormat, GL_UNSIGNED_BYTE, data);
++    }
++
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    return true;
++}
++
++bool H264NvencEncoder::filterFrameGpu(const PipeWireFrame &frame)
++{
++    if (eglGetCurrentContext() != m_gpu->eglContext) {
++        if (!eglMakeCurrent(m_gpu->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_gpu->eglContext)) {
++            qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC failed to bind EGL context";
++            return false;
++        }
++    }
++
++    EGLImageKHR eglImage = EGL_NO_IMAGE_KHR;
++    GLuint activeSrcTex = 0;
++
++    if (frame.dmabuf) {
++        const auto &dmabuf = *frame.dmabuf;
++        if (dmabuf.width != m_gpu->srcSize.width() || dmabuf.height != m_gpu->srcSize.height() || dmabuf.planes.isEmpty()) {
++            return false;
++        }
++
++        if (m_gpu->hasDmaBufImport && !m_gpu->directDmaBufFailed) {
++            const uint32_t drmFormat = dmabuf.format ? dmabuf.format : PipeWireSourceStream::spaVideoFormatToDrmFormat(frame.format);
++            const bool useModifier = m_gpu->hasDmaBufModifiers && dmabuf.modifier != DRM_FORMAT_MOD_INVALID;
++
++            QVarLengthArray<EGLint, 48> attribs;
++            attribs.append(EGL_WIDTH);
++            attribs.append(dmabuf.width);
++            attribs.append(EGL_HEIGHT);
++            attribs.append(dmabuf.height);
++            attribs.append(EGL_LINUX_DRM_FOURCC_EXT);
++            attribs.append(static_cast<EGLint>(drmFormat));
++
++            static constexpr EGLint kFdKeys[4] = {
++                EGL_DMA_BUF_PLANE0_FD_EXT,
++                EGL_DMA_BUF_PLANE1_FD_EXT,
++                EGL_DMA_BUF_PLANE2_FD_EXT,
++                EGL_DMA_BUF_PLANE3_FD_EXT,
++            };
++            static constexpr EGLint kOffsetKeys[4] = {
++                EGL_DMA_BUF_PLANE0_OFFSET_EXT,
++                EGL_DMA_BUF_PLANE1_OFFSET_EXT,
++                EGL_DMA_BUF_PLANE2_OFFSET_EXT,
++                EGL_DMA_BUF_PLANE3_OFFSET_EXT,
++            };
++            static constexpr EGLint kPitchKeys[4] = {
++                EGL_DMA_BUF_PLANE0_PITCH_EXT,
++                EGL_DMA_BUF_PLANE1_PITCH_EXT,
++                EGL_DMA_BUF_PLANE2_PITCH_EXT,
++                EGL_DMA_BUF_PLANE3_PITCH_EXT,
++            };
++            static constexpr EGLint kModLoKeys[4] = {
++                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
++                EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
++                EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
++                EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
++            };
++            static constexpr EGLint kModHiKeys[4] = {
++                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
++                EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
++                EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
++                EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT,
++            };
++
++            const int planeCount = std::min<int>(dmabuf.planes.count(), 4);
++            for (int i = 0; i < planeCount; ++i) {
++                const auto &plane = dmabuf.planes[i];
++                attribs.append(kFdKeys[i]);
++                attribs.append(plane.fd);
++                attribs.append(kOffsetKeys[i]);
++                attribs.append(static_cast<EGLint>(plane.offset));
++                attribs.append(kPitchKeys[i]);
++                attribs.append(static_cast<EGLint>(plane.stride));
++                if (useModifier) {
++                    attribs.append(kModLoKeys[i]);
++                    attribs.append(static_cast<EGLint>(dmabuf.modifier & 0xffffffffu));
++                    attribs.append(kModHiKeys[i]);
++                    attribs.append(static_cast<EGLint>(dmabuf.modifier >> 32));
++                }
++            }
++            attribs.append(EGL_NONE);
++
++            eglImage = eglCreateImageKHR(m_gpu->eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.constData());
++            if (eglImage != EGL_NO_IMAGE_KHR) {
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, m_gpu->srcTex);
++                glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, eglImage);
++                activeSrcTex = m_gpu->srcTex;
++            }
++        }
++
++        if (activeSrcTex == 0) {
++            // Hybrid multi-GPU fallback (e.g. Intel compositor DMA-BUF + NVIDIA NVENC):
++            // download via session EGL then upload raw RGBA for GPU NV12 conversion.
++            if (m_gpu->fallbackImage.size() != m_gpu->srcSize) {
++                m_gpu->fallbackImage = QImage(m_gpu->srcSize, QImage::Format_RGBA8888_Premultiplied);
++            }
++            if (!m_dmaBufHandler.downloadFrame(m_gpu->fallbackImage, frame)) {
++                m_produce->m_stream->renegotiateModifierFailed(frame.format, dmabuf.modifier);
++                return false;
++            }
++            if (!m_gpu->directDmaBufFailed) {
++                qCWarning(PIPEWIRERECORD_LOGGING)
++                    << "NVENC direct DMA-BUF EGL import failed (modifier" << Qt::hex << dmabuf.modifier << "), using DmaBufHandler + GPU NV12 fallback";
++                m_gpu->directDmaBufFailed = true;
++            }
++            // DmaBufHandler bound its own EGL context; restore ours before uploading.
++            if (!eglMakeCurrent(m_gpu->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_gpu->eglContext)) {
++                return false;
++            }
++            if (!uploadImageToShmTexture(m_gpu->fallbackImage.constBits(),
++                                         m_gpu->fallbackImage.width(),
++                                         m_gpu->fallbackImage.height(),
++                                         static_cast<int>(m_gpu->fallbackImage.bytesPerLine()),
++                                         SPA_VIDEO_FORMAT_RGBA)) {
++                return false;
++            }
++            activeSrcTex = m_gpu->shmTex;
++        }
++    } else if (frame.dataFrame) {
++        const auto &df = *frame.dataFrame;
++        if (df.size != m_gpu->srcSize || !df.data) {
++            return false;
++        }
++        if (!uploadImageToShmTexture(df.data, df.size.width(), df.size.height(), df.stride, df.format)) {
++            QImage rgba = df.toImage().convertToFormat(QImage::Format_RGBA8888);
++            if (!uploadImageToShmTexture(rgba.constBits(),
++                                         rgba.width(),
++                                         rgba.height(),
++                                         static_cast<int>(rgba.bytesPerLine()),
++                                         SPA_VIDEO_FORMAT_RGBA)) {
++                return false;
++            }
++        }
++        activeSrcTex = m_gpu->shmTex;
++    } else {
++        return false;
++    }
++
++    const int fullRange = (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full) ? 1 : 0;
++    const int srcW = m_gpu->srcSize.width();
++    const int srcH = m_gpu->srcSize.height();
++    const int codedW = m_gpu->codedSize.width();
++    const int codedH = m_gpu->codedSize.height();
++
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, activeSrcTex);
++    glBindVertexArray(m_gpu->vao);
++
++    // Pass 1: Y plane (GL_R8, codedW x codedH)
++    glBindFramebuffer(GL_FRAMEBUFFER, m_gpu->fboY);
++    glViewport(0, 0, codedW, codedH);
++    glUseProgram(m_gpu->progY);
++    glUniform1i(m_gpu->yLocSrc, 0);
++    glUniform2i(m_gpu->yLocSrcSize, srcW, srcH);
++    glUniform1i(m_gpu->yLocFullRange, fullRange);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++
++    // Pass 2: interleaved UV plane (GL_RG8, codedW/2 x codedH/2)
++    glBindFramebuffer(GL_FRAMEBUFFER, m_gpu->fboUV);
++    glViewport(0, 0, codedW / 2, codedH / 2);
++    glUseProgram(m_gpu->progUV);
++    glUniform1i(m_gpu->uvLocSrc, 0);
++    glUniform2i(m_gpu->uvLocSrcSize, srcW, srcH);
++    glUniform1i(m_gpu->uvLocFullRange, fullRange);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++    if (eglImage != EGL_NO_IMAGE_KHR) {
++        // Ensure GL has finished sampling the PipeWire DMA-BUF before returning it.
++        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        if (fence) {
++            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
++            glDeleteSync(fence);
++        } else {
++            glFinish();
++        }
++        eglDestroyImageKHR(m_gpu->eglDisplay, eglImage);
++    } else {
++        glFlush();
++    }
++
++    AVFrame *cudaFrame = av_frame_alloc();
++    if (!cudaFrame) {
++        return false;
++    }
++    if (int err = av_hwframe_get_buffer(m_gpu->cudaFramesCtx, cudaFrame, 0); err < 0) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC failed to allocate CUDA frame:" << av_err2str(err);
++        av_frame_free(&cudaFrame);
++        return false;
++    }
++
++    cudaFrame->color_range = m_avCodecContext->color_range;
++    cudaFrame->colorspace = m_avCodecContext->colorspace;
++    cudaFrame->color_primaries = m_avCodecContext->color_primaries;
++    cudaFrame->color_trc = m_avCodecContext->color_trc;
++    if (frame.presentationTimestamp) {
++        cudaFrame->pts = m_produce->framePts(frame.presentationTimestamp);
++    }
++
++    // VRAM-to-VRAM copy from GL Y/UV textures into the pooled CUDA NV12 frame.
++    const auto &cuda = CudaApi::instance();
++    auto *devCtx = reinterpret_cast<AVHWDeviceContext *>(m_gpu->cudaDeviceCtx->data);
++    auto *cuCtx = reinterpret_cast<AvCudaDeviceContext *>(devCtx->hwctx);
++
++    bool copyOk = false;
++    if (cuda.ctxPushCurrent(cuCtx->cuda_ctx) == kCudaSuccess) {
++        CUgraphicsResource resources[2] = {m_gpu->yCudaRes, m_gpu->uvCudaRes};
++        if (cuda.graphicsMapResources(2, resources, cuCtx->stream) == kCudaSuccess) {
++            CUarray yArr = nullptr;
++            CUarray uvArr = nullptr;
++            if (cuda.graphicsSubResourceGetMappedArray(&yArr, m_gpu->yCudaRes, 0, 0) == kCudaSuccess
++                && cuda.graphicsSubResourceGetMappedArray(&uvArr, m_gpu->uvCudaRes, 0, 0) == kCudaSuccess) {
++                CudaMemcpy2D cpY{};
++                cpY.srcMemoryType = kCuMemoryTypeArray;
++                cpY.srcArray = yArr;
++                cpY.dstMemoryType = kCuMemoryTypeDevice;
++                cpY.dstDevice = reinterpret_cast<CUdeviceptr>(cudaFrame->data[0]);
++                cpY.dstPitch = static_cast<size_t>(cudaFrame->linesize[0]);
++                cpY.WidthInBytes = static_cast<size_t>(codedW);
++                cpY.Height = static_cast<size_t>(codedH);
++
++                CudaMemcpy2D cpUV{};
++                cpUV.srcMemoryType = kCuMemoryTypeArray;
++                cpUV.srcArray = uvArr;
++                cpUV.dstMemoryType = kCuMemoryTypeDevice;
++                cpUV.dstDevice = reinterpret_cast<CUdeviceptr>(cudaFrame->data[1]);
++                cpUV.dstPitch = static_cast<size_t>(cudaFrame->linesize[1]);
++                cpUV.WidthInBytes = static_cast<size_t>(codedW);
++                cpUV.Height = static_cast<size_t>(codedH / 2);
++
++                copyOk = (cuda.memcpy2DAsync(&cpY, cuCtx->stream) == kCudaSuccess)
++                    && (cuda.memcpy2DAsync(&cpUV, cuCtx->stream) == kCudaSuccess);
++            }
++            cuda.graphicsUnmapResources(2, resources, cuCtx->stream);
++        }
++        CUcontext popped = nullptr;
++        cuda.ctxPopCurrent(&popped);
++    }
++
++    if (!copyOk) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC CUDA-GL copy failed";
++        av_frame_free(&cudaFrame);
++        return false;
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(m_gpu->queueMutex);
++        m_gpu->frameQueue.push_back(cudaFrame);
++    }
++    return true;
++}
++
++bool H264NvencEncoder::filterFrameSoftware(const PipeWireFrame &frame)
++{
++    const QSize size = m_produce->m_stream->size();
++    if (!frame.dmabuf || !m_swBufferPool || size != m_swPoolSize) {
++        return SoftwareEncoder::filterFrame(frame);
++    }
++
++    // Download directly into a pooled AVBuffer to avoid per-frame QImage malloc
++    // and the redundant av_image_copy performed by SoftwareEncoder::filterFrame().
++    AVBufferRef *buf = av_buffer_pool_get(m_swBufferPool);
++    if (!buf) {
++        return SoftwareEncoder::filterFrame(frame);
++    }
++
++    const int stride = size.width() * 4;
++    QImage wrapped(buf->data, size.width(), size.height(), stride, QImage::Format_RGBA8888_Premultiplied);
++    if (!m_dmaBufHandler.downloadFrame(wrapped, frame)) {
++        av_buffer_unref(&buf);
++        m_produce->m_stream->renegotiateModifierFailed(frame.format, frame.dmabuf->modifier);
++        return false;
++    }
++
++    AVFrame *avFrame = av_frame_alloc();
++    if (!avFrame) {
++        av_buffer_unref(&buf);
++        return false;
++    }
++
++    avFrame->format = AV_PIX_FMT_RGBA;
++    avFrame->width = size.width();
++    avFrame->height = size.height();
++    avFrame->data[0] = buf->data;
++    avFrame->linesize[0] = stride;
++    avFrame->buf[0] = buf;
++    if (frame.presentationTimestamp) {
++        avFrame->pts = m_produce->framePts(frame.presentationTimestamp);
++    }
++
++    const int result = av_buffersrc_add_frame(m_inputFilter, avFrame);
++    av_frame_free(&avFrame);
++    if (result < 0) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "Failed to submit frame for filtering:" << av_err2str(result);
++        return false;
++    }
++
++    return true;
++}
++
++bool H264NvencEncoder::filterFrame(const PipeWireFrame &frame)
++{
++    if (m_gpu) {
++        return filterFrameGpu(frame);
++    }
++    return filterFrameSoftware(frame);
++}
++
++std::pair<int, int> H264NvencEncoder::encodeFrame(int maximumFrames)
++{
++    if (!m_gpu) {
++        return SoftwareEncoder::encodeFrame(maximumFrames);
++    }
++
++    int filtered = 0;
++    int queued = 0;
++
++    for (;;) {
++        AVFrame *frame = nullptr;
++        {
++            std::lock_guard<std::mutex> lock(m_gpu->queueMutex);
++            if (m_gpu->frameQueue.empty()) {
++                break;
++            }
++            frame = m_gpu->frameQueue.front();
++            m_gpu->frameQueue.pop_front();
++        }
++
++        if (queued < maximumFrames) {
++            int ret = -1;
++            {
++                std::lock_guard<std::mutex> guard(m_avCodecMutex);
++                ret = avcodec_send_frame(m_avCodecContext, frame);
++            }
++            if (ret == AVERROR(EAGAIN)) {
++                // Keep the frame at the head of the queue for the next pass.
++                std::lock_guard<std::mutex> lock(m_gpu->queueMutex);
++                m_gpu->frameQueue.push_front(frame);
++                break;
++            }
++            filtered++;
++            av_frame_free(&frame);
++            if (ret < 0) {
++                if (ret != AVERROR_EOF) {
++                    qCWarning(PIPEWIRERECORD_LOGGING) << "Error sending CUDA frame to NVENC:" << av_err2str(ret);
++                }
++                break;
++            }
++            queued++;
++        } else {
++            filtered++;
++            qCWarning(PIPEWIRERECORD_LOGGING) << "Encode queue is full, discarding frame" << frame->pts;
++            av_frame_free(&frame);
++        }
++    }
++
++    return std::make_pair(filtered, queued);
++}
++
++AVDictionary *H264NvencEncoder::buildEncodingOptions()
++{
++    AVDictionary *options = nullptr;
++
++    // h264_nvenc uses its own private profile option (which defaults to "high"
++    // and overrides AVCodecContext::profile), so set it explicitly.
++    switch (m_profile) {
++    case H264Profile::Baseline:
++        av_dict_set(&options, "profile", "baseline", 0);
++        break;
++    case H264Profile::Main:
++        av_dict_set(&options, "profile", "main", 0);
++        break;
++    case H264Profile::High:
++        av_dict_set(&options, "profile", "high", 0);
++        break;
++    }
++
++    // libx264-style presets are rejected by h264_nvenc, so use NVENC's own.
++    // Speed / NoPreference target interactive streaming (KRdp) with zero frame
++    // buffering; Quality / Size keep NVENC's HQ lookahead pipeline intact.
++    switch (m_encodingPreference) {
++    case PipeWireBaseEncodedStream::EncodingPreference::Speed:
++        av_dict_set(&options, "preset", "p1", 0);
++        av_dict_set(&options, "tune", "ull", 0);
++        av_dict_set(&options, "multipass", "disabled", 0);
++        av_dict_set(&options, "zerolatency", "1", 0);
++        av_dict_set_int(&options, "delay", 0, 0);
++        av_dict_set_int(&options, "surfaces", 8, 0);
++        break;
++    case PipeWireBaseEncodedStream::EncodingPreference::Quality:
++        av_dict_set(&options, "preset", "p6", 0);
++        av_dict_set(&options, "tune", "hq", 0);
++        break;
++    case PipeWireBaseEncodedStream::EncodingPreference::Size:
++        av_dict_set(&options, "preset", "p7", 0);
++        av_dict_set(&options, "tune", "hq", 0);
++        break;
++    case PipeWireBaseEncodedStream::EncodingPreference::NoPreference:
++    default:
++        av_dict_set(&options, "preset", "p4", 0);
++        av_dict_set(&options, "tune", "ll", 0);
++        av_dict_set(&options, "multipass", "disabled", 0);
++        av_dict_set(&options, "zerolatency", "1", 0);
++        av_dict_set_int(&options, "delay", 0, 0);
++        av_dict_set_int(&options, "surfaces", 8, 0);
++        break;
++    }
++
++    // Constant-quality VBR: let NVENC pick the bitrate needed to hit the quality target.
++    // cq is only read when the codec is opened, so later quality changes are ignored.
++    const int cq = m_quality ? std::clamp(int(51 - (m_quality.value() / 100.0) * 51), 1, 51) : 25;
++    av_dict_set(&options, "rc", "vbr", 0);
++    av_dict_set_int(&options, "cq", cq, 0);
++    av_dict_set_int(&options, "b", 0, 0);
++
++    return options;
++}
+--- a/src/h264nvencencoder_p.h
++++ b/src/h264nvencencoder_p.h
+@@ -0,0 +1,53 @@
++/*
++    SPDX-FileCopyrightText: 2026 Local patch
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include <memory>
++
++#include "encoder_p.h"
++
++struct AVBufferPool;
++
++/**
++ * Hardware H.264 encoder using NVIDIA NVENC (h264_nvenc).
++ *
++ * When a CUDA-capable NVIDIA EGL/GBM render node is available, DMA-BUF frames
++ * are imported directly on the GPU via EGLImage, converted to BT.709 NV12
++ * (full or limited range, with black padding for odd dimensions) in OpenGL,
++ * copied VRAM-to-VRAM into a pooled AV_PIX_FMT_CUDA surface via CUDA-GL
++ * interop, and handed straight to h264_nvenc with zero PCIe round-trip.
++ *
++ * If GPU interop cannot be initialized (or KPIPEWIRE_NVENC_NO_ZEROCOPY=1 is
++ * set), it falls back to a pooled single-pass NV12 software upload path.
++ */
++class H264NvencEncoder : public SoftwareEncoder
++{
++public:
++    H264NvencEncoder(H264Profile profile, PipeWireProduce *produce);
++    ~H264NvencEncoder() override;
++
++    bool initialize(const QSize &size) override;
++    bool filterFrame(const PipeWireFrame &frame) override;
++    std::pair<int, int> encodeFrame(int maximumFrames) override;
++
++protected:
++    AVDictionary *buildEncodingOptions() override;
++
++private:
++    struct GpuState;
++
++    bool initializeGpuPath(const QSize &size);
++    void cleanupGpuPath();
++    bool filterFrameGpu(const PipeWireFrame &frame);
++    bool filterFrameSoftware(const PipeWireFrame &frame);
++    bool uploadImageToShmTexture(const void *data, int width, int height, int stride, spa_video_format format);
++
++    H264Profile m_profile = H264Profile::Main;
++    std::unique_ptr<GpuState> m_gpu;
++    AVBufferPool *m_swBufferPool = nullptr;
++    QSize m_swPoolSize;
++};
 --- a/src/pipewireproduce.cpp
 +++ b/src/pipewireproduce.cpp
 @@ -22,6 +22,7 @@
@@ -57,7 +1389,140 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
  
      if (m_stream) {
          m_stream->setMaxFramerate(framerate);
-@@ -714,17 +716,9 @@
+@@ -276,23 +278,47 @@
+     m_pendingEncodeFrames = 0;
+ }
+ 
++void PipeWireProduce::notifyPassthrough()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_passthroughMutex);
++        m_passthroughPending = true;
++    }
++    m_passthroughCondition.notify_one();
++}
++
++void PipeWireProduce::notifyOutput()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_outputMutex);
++        m_outputPending = true;
++    }
++    m_outputCondition.notify_one();
++}
++
+ void PipeWireProduce::startThreads()
+ {
++    m_passthroughRunning = true;
++    m_passthroughPending = false;
+     m_passthroughThread = std::thread([this]() {
+-        m_passthroughRunning = true;
+-        while (m_passthroughRunning) {
+-            std::unique_lock<std::mutex> lock(m_passthroughMutex);
+-            m_passthroughCondition.wait(lock);
+-
+-            if (!m_passthroughRunning) {
+-                break;
++        while (true) {
++            {
++                std::unique_lock<std::mutex> lock(m_passthroughMutex);
++                m_passthroughCondition.wait(lock, [this]() {
++                    return !m_passthroughRunning || m_passthroughPending;
++                });
++
++                if (!m_passthroughRunning) {
++                    break;
++                }
++                m_passthroughPending = false;
+             }
+ 
+             auto [filtered, queued] = m_encoder->encodeFrame(m_maxPendingFrames - m_pendingEncodeFrames);
+             m_pendingFilterFrames -= filtered;
+             m_pendingEncodeFrames += queued;
+ 
+-            m_outputCondition.notify_all();
++            notifyOutput();
+         }
+     });
+ #if defined(Q_OS_OPENBSD)
+@@ -301,14 +327,20 @@
+     pthread_setname_np(m_passthroughThread.native_handle(), "PipeWireProduce::passthrough");
+ #endif
+ 
++    m_outputRunning = true;
++    m_outputPending = false;
+     m_outputThread = std::thread([this]() {
+-        m_outputRunning = true;
+-        while (m_outputRunning) {
+-            std::unique_lock<std::mutex> lock(m_outputMutex);
+-            m_outputCondition.wait(lock);
+-
+-            if (!m_outputRunning) {
+-                break;
++        while (true) {
++            {
++                std::unique_lock<std::mutex> lock(m_outputMutex);
++                m_outputCondition.wait(lock, [this]() {
++                    return !m_outputRunning || m_outputPending;
++                });
++
++                if (!m_outputRunning) {
++                    break;
++                }
++                m_outputPending = false;
+             }
+ 
+             auto received = m_encoder->receivePacket();
+@@ -339,13 +371,19 @@
+ void PipeWireProduce::stopThreads()
+ {
+     if (m_passthroughThread.joinable()) {
+-        m_passthroughRunning = false;
++        {
++            std::lock_guard<std::mutex> lock(m_passthroughMutex);
++            m_passthroughRunning = false;
++        }
+         m_passthroughCondition.notify_all();
+         m_passthroughThread.join();
+     }
+ 
+     if (m_outputThread.joinable()) {
+-        m_outputRunning = false;
++        {
++            std::lock_guard<std::mutex> lock(m_outputMutex);
++            m_outputRunning = false;
++        }
+         m_outputCondition.notify_all();
+         m_outputThread.join();
+     }
+@@ -420,7 +458,7 @@
+     state.ended = true;
+     // Close the encoder input so amix does not wait for data on it
+     m_audioEncoder->endInput(input);
+-    m_outputCondition.notify_all();
++    notifyOutput();
+ }
+ 
+ std::chrono::steady_clock::time_point PipeWireProduce::recordEpoch()
+@@ -507,7 +545,7 @@
+     }
+     av_frame_free(&avFrame);
+ 
+-    m_outputCondition.notify_all();
++    notifyOutput();
+ }
+ 
+ void PipeWireProduce::pushSilence(int input, int64_t sampleCount, quint32 channels, quint32 rate)
+@@ -565,7 +603,7 @@
+     }
+     state.anchored = true;
+     pushSilence(input, deficit, channels, rate);
+-    m_outputCondition.notify_all();
++    notifyOutput();
+ }
+ 
+ void PipeWireProduce::deactivate()
+@@ -714,17 +752,9 @@
      }
  
      auto pts = framePts(frame.presentationTimestamp);
@@ -78,7 +1543,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
      }
  
      if (m_encoderPaused) {
-@@ -752,6 +746,11 @@
+@@ -752,8 +782,13 @@
  
      m_pendingFilterFrames++;
      m_previousPts = pts;
@@ -88,9 +1553,30 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        m_nextFramePts = std::clamp(m_nextFramePts, pts - 1.0, double(pts) + 1.0) + frameTime;
 +    }
  
-     m_passthroughCondition.notify_all();
+-    m_passthroughCondition.notify_all();
++    notifyPassthrough();
  }
-@@ -820,6 +819,15 @@
+ 
+ void PipeWireProduce::stateChanged(pw_stream_state state)
+@@ -780,7 +815,7 @@
+         // If we have pending frames, wait with cleanup until all frames have been processed.
+         qCDebug(PIPEWIRERECORD_LOGGING) << "Waiting for frame queues to empty, still pending filter" << m_pendingFilterFrames << "encode"
+                                         << m_pendingEncodeFrames;
+-        m_passthroughCondition.notify_all();
++        notifyPassthrough();
+     }
+ }
+ 
+@@ -795,7 +830,7 @@
+     // need a different trigger to make the filtering thread process frames.
+     // Triggering here means the filter thread runs as fast as the encode thread
+     // can process the frames.
+-    m_passthroughCondition.notify_all();
++    notifyPassthrough();
+ 
+     if (m_pendingFilterFrames <= 0) {
+         m_encoder->finish();
+@@ -820,6 +855,15 @@
      case PipeWireBaseEncodedStream::H264Main: {
          auto profile = m_encoderType == PipeWireBaseEncodedStream::H264Baseline ? Encoder::H264Profile::Baseline : Encoder::H264Profile::Main;
  
@@ -117,7 +1603,18 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
      QSize m_requestedSize;
  
      std::optional<quint8> m_quality;
-@@ -238,6 +238,7 @@
+@@ -232,12 +232,18 @@
+ 
+     std::condition_variable m_passthroughCondition;
+     std::mutex m_passthroughMutex;
++    bool m_passthroughPending = false;
+     std::condition_variable m_outputCondition;
+     std::mutex m_outputMutex;
++    bool m_outputPending = false;
++
++    void notifyPassthrough();
++    void notifyOutput();
+ 
      std::atomic_bool m_deactivated = false;
  
      int64_t m_previousPts = -1;
@@ -125,7 +1622,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
  
      std::atomic_int m_pendingFilterFrames = 0;
      std::atomic_int m_pendingEncodeFrames = 0;
-@@ -251,8 +252,6 @@
+@@ -251,8 +257,6 @@
      // Controls how many frames we can push into ffmpeg's encoding stream
      std::atomic_int m_maxPendingFrames = 50;
  
@@ -134,173 +1631,3 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
      std::unique_ptr<QTimer> m_frameStatisticsTimer;
  
      std::atomic_bool m_encoderPaused = false;
-diff --git a/src/h264nvencencoder.cpp b/src/h264nvencencoder.cpp
-new file mode 100644
---- /dev/null
-+++ b/src/h264nvencencoder.cpp
-@@ -0,0 +1,129 @@
-+/*
-+    SPDX-FileCopyrightText: 2026 Local patch
-+
-+    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
-+*/
-+
-+#include "h264nvencencoder_p.h"
-+
-+#include <algorithm>
-+#include <cmath>
-+
-+#include <QSize>
-+
-+extern "C" {
-+#include <libavcodec/avcodec.h>
-+#include <libavutil/pixfmt.h>
-+}
-+
-+#include "logging_record.h"
-+
-+#ifndef AV_PROFILE_H264_BASELINE // ffmpeg before 8.0
-+#define AV_PROFILE_H264_BASELINE FF_PROFILE_H264_BASELINE
-+#define AV_PROFILE_H264_MAIN FF_PROFILE_H264_MAIN
-+#define AV_PROFILE_H264_HIGH FF_PROFILE_H264_HIGH
-+#endif
-+
-+using namespace Qt::StringLiterals;
-+
-+H264NvencEncoder::H264NvencEncoder(H264Profile profile, PipeWireProduce *produce)
-+    : SoftwareEncoder(produce)
-+    , m_profile(profile)
-+{
-+}
-+
-+bool H264NvencEncoder::initialize(const QSize &size)
-+{
-+    // setColorRange() runs after construction, so the filter graph is built here.
-+    const auto colorRange = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? u"full"_s : u"limited"_s;
-+    // Pad to even dimensions so we fill with black instead of garbage.
-+    m_filterGraphToParse = u"format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_range=%1"_s.arg(colorRange);
-+
-+    if (!createFilterGraph(size)) {
-+        return false;
-+    }
-+
-+    auto codec = avcodec_find_encoder_by_name("h264_nvenc");
-+    if (!codec) {
-+        qCWarning(PIPEWIRERECORD_LOGGING) << "h264_nvenc codec not found";
-+        return false;
-+    }
-+
-+    m_avCodecContext = avcodec_alloc_context3(codec);
-+    if (!m_avCodecContext) {
-+        qCWarning(PIPEWIRERECORD_LOGGING) << "Could not allocate video codec context";
-+        return false;
-+    }
-+
-+    Q_ASSERT(!size.isEmpty());
-+    m_avCodecContext->width = std::ceil(size.width() / 2.0) * 2;
-+    m_avCodecContext->height = std::ceil(size.height() / 2.0) * 2;
-+    m_avCodecContext->max_b_frames = 0;
-+    m_avCodecContext->gop_size = 100;
-+    m_avCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
-+    m_avCodecContext->time_base = AVRational{1, 1000};
-+    m_avCodecContext->color_range = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-+    // Without a frame rate NVENC assumes 1/time_base, i.e. 1000 fps, and signals an
-+    // unreasonably high level: give it the stream's real maximum frame rate.
-+    const Fraction framerate = m_produce->maxFramerate();
-+    if (framerate.numerator > 0 && framerate.denominator > 0) {
-+        m_avCodecContext->framerate = AVRational{int(framerate.numerator), int(framerate.denominator)};
-+    }
-+
-+    switch (m_profile) {
-+    case H264Profile::Baseline:
-+        m_avCodecContext->profile = AV_PROFILE_H264_BASELINE;
-+        break;
-+    case H264Profile::Main:
-+        m_avCodecContext->profile = AV_PROFILE_H264_MAIN;
-+        break;
-+    case H264Profile::High:
-+        m_avCodecContext->profile = AV_PROFILE_H264_HIGH;
-+        break;
-+    }
-+
-+    AVDictionary *options = buildEncodingOptions();
-+    maybeLogOptions(options);
-+
-+    if (int result = avcodec_open2(m_avCodecContext, codec, &options); result < 0) {
-+        qCWarning(PIPEWIRERECORD_LOGGING) << "Could not open h264_nvenc codec" << av_err2str(result);
-+        return false;
-+    }
-+
-+    return true;
-+}
-+
-+AVDictionary *H264NvencEncoder::buildEncodingOptions()
-+{
-+    AVDictionary *options = Encoder::buildEncodingOptions();
-+
-+    // libx264-style presets are rejected by h264_nvenc, so use NVENC's own.
-+    switch (m_encodingPreference) {
-+    case PipeWireBaseEncodedStream::EncodingPreference::Speed:
-+        av_dict_set(&options, "preset", "p1", 0);
-+        av_dict_set(&options, "tune", "ll", 0);
-+        break;
-+    case PipeWireBaseEncodedStream::EncodingPreference::Quality:
-+        av_dict_set(&options, "preset", "p6", 0);
-+        av_dict_set(&options, "tune", "hq", 0);
-+        break;
-+    case PipeWireBaseEncodedStream::EncodingPreference::Size:
-+        av_dict_set(&options, "preset", "p7", 0);
-+        av_dict_set(&options, "tune", "hq", 0);
-+        break;
-+    case PipeWireBaseEncodedStream::EncodingPreference::NoPreference:
-+    default:
-+        av_dict_set(&options, "preset", "p4", 0);
-+        av_dict_set(&options, "tune", "hq", 0);
-+        break;
-+    }
-+
-+    // Constant-quality VBR: let NVENC pick the bitrate needed to hit the quality target.
-+    // cq is only read when the codec is opened, so later quality changes are ignored.
-+    const int cq = m_quality ? std::clamp(int(51 - (m_quality.value() / 100.0) * 51), 1, 51) : 25;
-+    av_dict_set(&options, "rc", "vbr", 0);
-+    av_dict_set_int(&options, "cq", cq, 0);
-+    av_dict_set_int(&options, "b", 0, 0);
-+
-+    return options;
-+}
-diff --git a/src/h264nvencencoder_p.h b/src/h264nvencencoder_p.h
-new file mode 100644
---- /dev/null
-+++ b/src/h264nvencencoder_p.h
-@@ -0,0 +1,31 @@
-+/*
-+    SPDX-FileCopyrightText: 2026 Local patch
-+
-+    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
-+*/
-+
-+#pragma once
-+
-+#include "encoder_p.h"
-+
-+/**
-+ * A software encoder that uses NVIDIA NVENC (h264_nvenc) to encode to H264.
-+ *
-+ * Frames are downloaded to system memory and converted to yuv420p like the
-+ * other software encoders, then handed to h264_nvenc, which uploads them to
-+ * the GPU and encodes in hardware. This avoids the VAAPI path, which is
-+ * decode-only on NVIDIA and therefore cannot encode.
-+ */
-+class H264NvencEncoder : public SoftwareEncoder
-+{
-+public:
-+    H264NvencEncoder(H264Profile profile, PipeWireProduce *produce);
-+
-+    bool initialize(const QSize &size) override;
-+
-+protected:
-+    AVDictionary *buildEncodingOptions() override;
-+
-+private:
-+    H264Profile m_profile = H264Profile::Main;
-+};
