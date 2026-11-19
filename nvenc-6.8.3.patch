@@ -1,0 +1,306 @@
+Add NVIDIA NVENC (h264_nvenc) H264 encoder for KPipeWire 6.8.3
+
+On NVIDIA the VAAPI driver is decode-only, so H264VAAPIEncoder cannot
+encode and KPipeWire falls back to CPU libx264. Add H264NvencEncoder, a
+SoftwareEncoder subclass that converts frames to yuv420p and hands them
+to FFmpeg's h264_nvenc, which uploads and encodes in hardware.
+
+Uses the 6.8.3 encoder API: options are emitted through
+buildEncodingOptions(), and the filter graph is built in initialize()
+because setColorRange() runs after construction. NVENC-valid presets
+(p1..p7, tune hq/ll) replace the libx264 ones, which h264_nvenc rejects.
+Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
+
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -140,6 +140,7 @@
+                             libopusencoder.cpp
+                             gifencoder.cpp
+                             h264vaapiencoder.cpp
++                            h264nvencencoder.cpp
+                             libx264encoder.cpp
+                             libopenh264encoder.cpp
+                             libvpxencoder.cpp
+--- a/src/pipewireproduce.cpp
++++ b/src/pipewireproduce.cpp
+@@ -22,6 +22,7 @@
+ #include "audioconstants_p.h"
+ #include "audioencoder_p.h"
+ #include "gifencoder_p.h"
++#include "h264nvencencoder_p.h"
+ #include "h264vaapiencoder_p.h"
+ #include "libopenh264encoder_p.h"
+ #include "libvpxencoder_p.h"
+@@ -77,7 +78,7 @@
+     , m_objectSerial(objectSerial)
+     , m_encoderType(encoderType)
+     , m_fd(fd)
+-    , m_frameRate(framerate)
++    , m_maxFramerate(framerate)
+ {
+     qRegisterMetaType<std::optional<int>>();
+     qRegisterMetaType<std::optional<std::chrono::nanoseconds>>();
+@@ -90,7 +91,7 @@
+ void PipeWireProduce::initialize()
+ {
+     m_stream.reset(new PipeWireSourceStream(nullptr));
+-    m_stream->setMaxFramerate(m_frameRate);
++    m_stream->setMaxFramerate(m_maxFramerate);
+     m_stream->setRequestedSize(m_requestedSize);
+ 
+     // The check in supportsHardwareEncoding() is insufficient to fully
+@@ -136,6 +137,7 @@
+ void PipeWireProduce::setMaxFramerate(const Fraction &framerate)
+ {
+     m_maxFramerate = framerate;
++    m_nextFramePts = 0;
+ 
+     if (m_stream) {
+         m_stream->setMaxFramerate(framerate);
+@@ -714,17 +716,9 @@
+     }
+ 
+     auto pts = framePts(frame.presentationTimestamp);
+-    // Always accept the first frame: it carries the initial screen content
+-    // and, for a static screen, may be the only frame ever delivered.
+-    if (m_previousPts >= 0) {
+-        if (pts <= m_previousPts) {
+-            return;
+-        }
+-
+-        auto frameTime = 1000.0 / (m_maxFramerate.numerator / m_maxFramerate.denominator);
+-        if ((pts - m_previousPts) < frameTime) {
+-            return;
+-        }
++    // PTS is rounded to milliseconds, so allow a frame in the deadline's millisecond.
++    if (m_previousPts >= 0 && (pts <= m_previousPts || pts + 1 <= m_nextFramePts)) {
++        return;
+     }
+ 
+     if (m_encoderPaused) {
+@@ -752,6 +746,11 @@
+ 
+     m_pendingFilterFrames++;
+     m_previousPts = pts;
++    if (m_maxFramerate.numerator > 0 && m_maxFramerate.denominator > 0) {
++        const double frameTime = 1000.0 * m_maxFramerate.denominator / m_maxFramerate.numerator;
++        // Carry sub-millisecond timing forward without catching up after a long gap.
++        m_nextFramePts = std::clamp(m_nextFramePts, pts - 1.0, double(pts) + 1.0) + frameTime;
++    }
+ 
+     m_passthroughCondition.notify_all();
+ }
+@@ -820,6 +819,15 @@
+     case PipeWireBaseEncodedStream::H264Main: {
+         auto profile = m_encoderType == PipeWireBaseEncodedStream::H264Baseline ? Encoder::H264Profile::Baseline : Encoder::H264Profile::Main;
+ 
++        // Try NVIDIA NVENC first: on NVIDIA the VAAPI driver is decode-only and
++        // cannot encode, so prefer the native hardware encoder when available.
++        if (forcedEncoder.isNull() || forcedEncoder == u"h264_nvenc") {
++            auto encoder = std::make_unique<H264NvencEncoder>(profile, this);
++            if (setupEncoder(encoder.get(), size)) {
++                return encoder;
++            }
++        }
++
+         if (forcedEncoder.isNull() || forcedEncoder == u"h264_vaapi") {
+             auto encoder = std::make_unique<H264VAAPIEncoder>(profile, this);
+             if (setupEncoder(encoder.get(), size)) {
+--- a/src/pipewireproduce_p.h
++++ b/src/pipewireproduce_p.h
+@@ -208,7 +208,7 @@
+     std::optional<std::chrono::steady_clock::time_point> m_recordEpoch;
+ 
+     uint m_fd;
+-    Fraction m_frameRate;
++    Fraction m_maxFramerate;
+     QSize m_requestedSize;
+ 
+     std::optional<quint8> m_quality;
+@@ -238,6 +238,7 @@
+     std::atomic_bool m_deactivated = false;
+ 
+     int64_t m_previousPts = -1;
++    double m_nextFramePts = 0;
+ 
+     std::atomic_int m_pendingFilterFrames = 0;
+     std::atomic_int m_pendingEncodeFrames = 0;
+@@ -251,8 +252,6 @@
+     // Controls how many frames we can push into ffmpeg's encoding stream
+     std::atomic_int m_maxPendingFrames = 50;
+ 
+-    Fraction m_maxFramerate = {60, 1};
+-
+     std::unique_ptr<QTimer> m_frameStatisticsTimer;
+ 
+     std::atomic_bool m_encoderPaused = false;
+diff --git a/src/h264nvencencoder.cpp b/src/h264nvencencoder.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/h264nvencencoder.cpp
+@@ -0,0 +1,129 @@
++/*
++    SPDX-FileCopyrightText: 2026 Local patch
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "h264nvencencoder_p.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <QSize>
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavutil/pixfmt.h>
++}
++
++#include "logging_record.h"
++
++#ifndef AV_PROFILE_H264_BASELINE // ffmpeg before 8.0
++#define AV_PROFILE_H264_BASELINE FF_PROFILE_H264_BASELINE
++#define AV_PROFILE_H264_MAIN FF_PROFILE_H264_MAIN
++#define AV_PROFILE_H264_HIGH FF_PROFILE_H264_HIGH
++#endif
++
++using namespace Qt::StringLiterals;
++
++H264NvencEncoder::H264NvencEncoder(H264Profile profile, PipeWireProduce *produce)
++    : SoftwareEncoder(produce)
++    , m_profile(profile)
++{
++}
++
++bool H264NvencEncoder::initialize(const QSize &size)
++{
++    // setColorRange() runs after construction, so the filter graph is built here.
++    const auto colorRange = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? u"full"_s : u"limited"_s;
++    // Pad to even dimensions so we fill with black instead of garbage.
++    m_filterGraphToParse = u"format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_range=%1"_s.arg(colorRange);
++
++    if (!createFilterGraph(size)) {
++        return false;
++    }
++
++    auto codec = avcodec_find_encoder_by_name("h264_nvenc");
++    if (!codec) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "h264_nvenc codec not found";
++        return false;
++    }
++
++    m_avCodecContext = avcodec_alloc_context3(codec);
++    if (!m_avCodecContext) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "Could not allocate video codec context";
++        return false;
++    }
++
++    Q_ASSERT(!size.isEmpty());
++    m_avCodecContext->width = std::ceil(size.width() / 2.0) * 2;
++    m_avCodecContext->height = std::ceil(size.height() / 2.0) * 2;
++    m_avCodecContext->max_b_frames = 0;
++    m_avCodecContext->gop_size = 100;
++    m_avCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
++    m_avCodecContext->time_base = AVRational{1, 1000};
++    m_avCodecContext->color_range = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++    // Without a frame rate NVENC assumes 1/time_base, i.e. 1000 fps, and signals an
++    // unreasonably high level: give it the stream's real maximum frame rate.
++    const Fraction framerate = m_produce->maxFramerate();
++    if (framerate.numerator > 0 && framerate.denominator > 0) {
++        m_avCodecContext->framerate = AVRational{int(framerate.numerator), int(framerate.denominator)};
++    }
++
++    switch (m_profile) {
++    case H264Profile::Baseline:
++        m_avCodecContext->profile = AV_PROFILE_H264_BASELINE;
++        break;
++    case H264Profile::Main:
++        m_avCodecContext->profile = AV_PROFILE_H264_MAIN;
++        break;
++    case H264Profile::High:
++        m_avCodecContext->profile = AV_PROFILE_H264_HIGH;
++        break;
++    }
++
++    AVDictionary *options = buildEncodingOptions();
++    maybeLogOptions(options);
++
++    if (int result = avcodec_open2(m_avCodecContext, codec, &options); result < 0) {
++        qCWarning(PIPEWIRERECORD_LOGGING) << "Could not open h264_nvenc codec" << av_err2str(result);
++        return false;
++    }
++
++    return true;
++}
++
++AVDictionary *H264NvencEncoder::buildEncodingOptions()
++{
++    AVDictionary *options = Encoder::buildEncodingOptions();
++
++    // libx264-style presets are rejected by h264_nvenc, so use NVENC's own.
++    switch (m_encodingPreference) {
++    case PipeWireBaseEncodedStream::EncodingPreference::Speed:
++        av_dict_set(&options, "preset", "p1", 0);
++        av_dict_set(&options, "tune", "ll", 0);
++        break;
++    case PipeWireBaseEncodedStream::EncodingPreference::Quality:
++        av_dict_set(&options, "preset", "p6", 0);
++        av_dict_set(&options, "tune", "hq", 0);
++        break;
++    case PipeWireBaseEncodedStream::EncodingPreference::Size:
++        av_dict_set(&options, "preset", "p7", 0);
++        av_dict_set(&options, "tune", "hq", 0);
++        break;
++    case PipeWireBaseEncodedStream::EncodingPreference::NoPreference:
++    default:
++        av_dict_set(&options, "preset", "p4", 0);
++        av_dict_set(&options, "tune", "hq", 0);
++        break;
++    }
++
++    // Constant-quality VBR: let NVENC pick the bitrate needed to hit the quality target.
++    // cq is only read when the codec is opened, so later quality changes are ignored.
++    const int cq = m_quality ? std::clamp(int(51 - (m_quality.value() / 100.0) * 51), 1, 51) : 25;
++    av_dict_set(&options, "rc", "vbr", 0);
++    av_dict_set_int(&options, "cq", cq, 0);
++    av_dict_set_int(&options, "b", 0, 0);
++
++    return options;
++}
+diff --git a/src/h264nvencencoder_p.h b/src/h264nvencencoder_p.h
+new file mode 100644
+--- /dev/null
++++ b/src/h264nvencencoder_p.h
+@@ -0,0 +1,31 @@
++/*
++    SPDX-FileCopyrightText: 2026 Local patch
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include "encoder_p.h"
++
++/**
++ * A software encoder that uses NVIDIA NVENC (h264_nvenc) to encode to H264.
++ *
++ * Frames are downloaded to system memory and converted to yuv420p like the
++ * other software encoders, then handed to h264_nvenc, which uploads them to
++ * the GPU and encodes in hardware. This avoids the VAAPI path, which is
++ * decode-only on NVIDIA and therefore cannot encode.
++ */
++class H264NvencEncoder : public SoftwareEncoder
++{
++public:
++    H264NvencEncoder(H264Profile profile, PipeWireProduce *produce);
++
++    bool initialize(const QSize &size) override;
++
++protected:
++    AVDictionary *buildEncodingOptions() override;
++
++private:
++    H264Profile m_profile = H264Profile::Main;
++};
