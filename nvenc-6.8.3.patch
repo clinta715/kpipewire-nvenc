@@ -11,16 +11,19 @@ VRAM-to-VRAM into a pooled AV_PIX_FMT_CUDA frame via CUDA-GL interop
 (libcuda.so.1 loaded dynamically), and encoded directly by h264_nvenc
 with zero PCIe round-trip or CPU swscale.
 
-Falls back cleanly to a pooled single-pass NV12 software path when GPU
-interop is unavailable (or KPIPEWIRE_NVENC_NO_ZEROCOPY=1 is set).
+Falls back cleanly to a non-debug, EGLImage-cached GL_BGRA downloader
+for hybrid multi-GPU DMA-BUFs (e.g. Intel/AMD compositor + NVIDIA NVENC),
+or a pooled single-pass NV12 software path when GPU interop is unavailable
+(or KPIPEWIRE_NVENC_NO_ZEROCOPY=1 is set).
 
 Also configures h264_nvenc with explicit profile, spatial AQ, disabled
 unused SEI side-data, zero-latency options (zerolatency=1, delay=0,
 multipass=disabled, surfaces=8) for Speed/NoPreference, live runtime
 setQuality() VBR/VBV reconfiguration, persistent AVPacket/AVFrame reuse,
 env tuning overrides (KPIPEWIRE_NVENC_{PRESET,TUNE,CQ,MAXRATE,GOP,
-SPATIAL_AQ,INTRA_REFRESH}), sub-millisecond frame pacing, lost wakeup
-fixes, and inline packet draining for video-only PipeWireProduce streams.
+SPATIAL_AQ,INTRA_REFRESH}), per-second stage-timing and bitrate telemetry
+under kpipewire_record_framestatistics, sub-millisecond frame pacing,
+lost wakeup fixes, and inline packet draining for video-only streams.
 
 Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 
@@ -36,7 +39,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
                              libvpxencoder.cpp
 --- a/src/h264nvencencoder.cpp
 +++ b/src/h264nvencencoder.cpp
-@@ -0,0 +1,1709 @@
+@@ -0,0 +1,2082 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 Local patch
 +
@@ -46,6 +49,8 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +#include "h264nvencencoder_p.h"
 +
 +#include <algorithm>
++#include <atomic>
++#include <chrono>
 +#include <cmath>
 +#include <cstdint>
 +#include <cstring>
@@ -79,6 +84,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +#include <libavutil/pixfmt.h>
 +}
 +
++#include "logging_frame_statistics.h"
 +#include "logging_record.h"
 +
 +#ifndef AV_PROFILE_H264_BASELINE // ffmpeg before 8.0
@@ -405,6 +411,138 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +constexpr size_t kMaxCachedEglImages = 16;
 +
++// Import a PipeWire DMA-BUF into an EGLImageKHR using a bounded LRU cache keyed
++// by kernel DMA-BUF identity (st_dev, st_ino) plus layout, evicting stale fd reuse.
++EGLImageKHR importDmaBufEglImage(EGLDisplay display,
++                                 bool hasDmaBufModifiers,
++                                 std::vector<CachedEglImage> &cache,
++                                 const DmaBufAttributes &dmabuf,
++                                 uint32_t drmFormat,
++                                 bool &isCached,
++                                 bool &cacheHit)
++{
++    isCached = false;
++    cacheHit = false;
++
++    const bool useModifier = hasDmaBufModifiers && dmabuf.modifier != DRM_FORMAT_MOD_INVALID;
++    const int planeCount = std::min<int>(dmabuf.planes.count(), 4);
++
++    DmaBufImageKey key;
++    key.width = dmabuf.width;
++    key.height = dmabuf.height;
++    key.drmFormat = drmFormat;
++    key.modifier = useModifier ? dmabuf.modifier : DRM_FORMAT_MOD_INVALID;
++    key.planeCount = planeCount;
++
++    bool canCache = true;
++    for (int i = 0; i < planeCount; ++i) {
++        const auto &plane = dmabuf.planes[i];
++        struct stat st{};
++        if (fstat(plane.fd, &st) != 0) {
++            canCache = false;
++            break;
++        }
++        key.planes[i] = {plane.fd, st.st_dev, st.st_ino, plane.offset, plane.stride};
++    }
++
++    if (canCache) {
++        for (auto it = cache.begin(); it != cache.end();) {
++            if (it->key == key) {
++                EGLImageKHR img = it->image;
++                if (it != cache.begin()) {
++                    std::rotate(cache.begin(), it, it + 1);
++                }
++                isCached = true;
++                cacheHit = true;
++                return img;
++            }
++            bool staleFd = false;
++            for (int i = 0; i < planeCount && !staleFd; ++i) {
++                for (int j = 0; j < it->key.planeCount; ++j) {
++                    if (it->key.planes[j].fd == key.planes[i].fd
++                        && (it->key.planes[j].dev != key.planes[i].dev || it->key.planes[j].ino != key.planes[i].ino)) {
++                        staleFd = true;
++                        break;
++                    }
++                }
++            }
++            if (staleFd) {
++                eglDestroyImageKHR(display, it->image);
++                it = cache.erase(it);
++            } else {
++                ++it;
++            }
++        }
++    }
++
++    QVarLengthArray<EGLint, 48> attribs;
++    attribs.append(EGL_WIDTH);
++    attribs.append(dmabuf.width);
++    attribs.append(EGL_HEIGHT);
++    attribs.append(dmabuf.height);
++    attribs.append(EGL_LINUX_DRM_FOURCC_EXT);
++    attribs.append(static_cast<EGLint>(drmFormat));
++
++    static constexpr EGLint kFdKeys[4] = {
++        EGL_DMA_BUF_PLANE0_FD_EXT,
++        EGL_DMA_BUF_PLANE1_FD_EXT,
++        EGL_DMA_BUF_PLANE2_FD_EXT,
++        EGL_DMA_BUF_PLANE3_FD_EXT,
++    };
++    static constexpr EGLint kOffsetKeys[4] = {
++        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
++        EGL_DMA_BUF_PLANE1_OFFSET_EXT,
++        EGL_DMA_BUF_PLANE2_OFFSET_EXT,
++        EGL_DMA_BUF_PLANE3_OFFSET_EXT,
++    };
++    static constexpr EGLint kPitchKeys[4] = {
++        EGL_DMA_BUF_PLANE0_PITCH_EXT,
++        EGL_DMA_BUF_PLANE1_PITCH_EXT,
++        EGL_DMA_BUF_PLANE2_PITCH_EXT,
++        EGL_DMA_BUF_PLANE3_PITCH_EXT,
++    };
++    static constexpr EGLint kModLoKeys[4] = {
++        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
++        EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
++        EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
++        EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
++    };
++    static constexpr EGLint kModHiKeys[4] = {
++        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
++        EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
++        EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
++        EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT,
++    };
++
++    for (int i = 0; i < planeCount; ++i) {
++        const auto &plane = dmabuf.planes[i];
++        attribs.append(kFdKeys[i]);
++        attribs.append(plane.fd);
++        attribs.append(kOffsetKeys[i]);
++        attribs.append(static_cast<EGLint>(plane.offset));
++        attribs.append(kPitchKeys[i]);
++        attribs.append(static_cast<EGLint>(plane.stride));
++        if (useModifier) {
++            attribs.append(kModLoKeys[i]);
++            attribs.append(static_cast<EGLint>(dmabuf.modifier & 0xffffffffu));
++            attribs.append(kModHiKeys[i]);
++            attribs.append(static_cast<EGLint>(dmabuf.modifier >> 32));
++        }
++    }
++    attribs.append(EGL_NONE);
++
++    EGLImageKHR img = eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.constData());
++    if (img != EGL_NO_IMAGE_KHR && canCache) {
++        if (cache.size() >= kMaxCachedEglImages) {
++            eglDestroyImageKHR(display, cache.back().image);
++            cache.pop_back();
++        }
++        cache.insert(cache.begin(), CachedEglImage{key, img});
++        isCached = true;
++    }
++    return img;
++}
++
 +// Parse bitrate strings such as "25M", "15000k", or "20000000" (bits/sec).
 +int64_t parseBitrateEnv(const char *varName)
 +{
@@ -472,7 +610,217 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +} // namespace
 +
++struct H264NvencEncoder::FastDmaBufDownloader {
++    int drmFd = -1;
++    gbm_device *gbmDevice = nullptr;
++    EGLDisplay eglDisplay = EGL_NO_DISPLAY;
++    EGLContext eglContext = EGL_NO_CONTEXT;
++    bool hasDmaBufModifiers = false;
++    GLuint tex = 0;
++    GLuint fbo = 0;
++    std::vector<CachedEglImage> imageCache;
++    bool triedInit = false;
++    bool initialized = false;
++
++    ~FastDmaBufDownloader()
++    {
++        cleanup();
++    }
++
++    void cleanup()
++    {
++        const bool haveContext = (eglDisplay != EGL_NO_DISPLAY && eglContext != EGL_NO_CONTEXT);
++        if (haveContext && eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, eglContext)) {
++            if (fbo) {
++                glDeleteFramebuffers(1, &fbo);
++                fbo = 0;
++            }
++            if (tex) {
++                glDeleteTextures(1, &tex);
++                tex = 0;
++            }
++            eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        }
++        if (eglDisplay != EGL_NO_DISPLAY) {
++            for (const auto &entry : imageCache) {
++                if (entry.image != EGL_NO_IMAGE_KHR) {
++                    eglDestroyImageKHR(eglDisplay, entry.image);
++                }
++            }
++            imageCache.clear();
++            if (eglContext != EGL_NO_CONTEXT) {
++                eglDestroyContext(eglDisplay, eglContext);
++                eglContext = EGL_NO_CONTEXT;
++            }
++            eglTerminate(eglDisplay);
++            eglDisplay = EGL_NO_DISPLAY;
++        }
++        if (gbmDevice) {
++            gbm_device_destroy(gbmDevice);
++            gbmDevice = nullptr;
++        }
++        if (drmFd >= 0) {
++            close(drmFd);
++            drmFd = -1;
++        }
++        initialized = false;
++    }
++
++    // Initialize a non-debug GBM/EGL context with persistent texture/FBO and
++    // LRU EGLImage cache. When skipRenderNode is set (hybrid multi-GPU fallback),
++    // skip that node so we open the compositor's GPU (e.g. Intel/AMD iGPU).
++    bool init(const QByteArray &skipRenderNode)
++    {
++        if (triedInit) {
++            return initialized;
++        }
++        triedInit = true;
++
++        QList<QByteArray> nodes = findCandidateRenderNodes();
++        if (!skipRenderNode.isEmpty()) {
++            nodes.removeAll(skipRenderNode);
++        }
++
++        for (const QByteArray &nodePath : nodes) {
++            int fd = open(nodePath.constData(), O_RDWR | O_CLOEXEC);
++            if (fd < 0) {
++                continue;
++            }
++            gbm_device *gbm = gbm_create_device(fd);
++            if (!gbm) {
++                close(fd);
++                continue;
++            }
++
++            EGLDisplay dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_MESA, gbm, nullptr);
++            EGLint major = 0;
++            EGLint minor = 0;
++            if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &major, &minor)) {
++                if (dpy != EGL_NO_DISPLAY) {
++                    eglTerminate(dpy);
++                }
++                gbm_device_destroy(gbm);
++                close(fd);
++                continue;
++            }
++
++            if (!epoxy_has_egl_extension(dpy, "EGL_EXT_image_dma_buf_import") || !eglBindAPI(EGL_OPENGL_API)) {
++                eglTerminate(dpy);
++                gbm_device_destroy(gbm);
++                close(fd);
++                continue;
++            }
++
++            static constexpr EGLint cfgAttribs[] = {
++                EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++                EGL_NONE,
++            };
++            EGLConfig cfg = nullptr;
++            EGLint cfgCount = 0;
++            if (!eglChooseConfig(dpy, cfgAttribs, &cfg, 1, &cfgCount) || cfgCount < 1) {
++                eglTerminate(dpy);
++                gbm_device_destroy(gbm);
++                close(fd);
++                continue;
++            }
++
++            // No EGL_CONTEXT_OPENGL_DEBUG (unlike DmaBufHandler) to avoid driver validation overhead.
++            EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, nullptr);
++            if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
++                if (ctx != EGL_NO_CONTEXT) {
++                    eglDestroyContext(dpy, ctx);
++                }
++                eglTerminate(dpy);
++                gbm_device_destroy(gbm);
++                close(fd);
++                continue;
++            }
++
++            GLuint t = 0;
++            GLuint f = 0;
++            glGenTextures(1, &t);
++            glBindTexture(GL_TEXTURE_2D, t);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            glGenFramebuffers(1, &f);
++
++            drmFd = fd;
++            gbmDevice = gbm;
++            eglDisplay = dpy;
++            eglContext = ctx;
++            hasDmaBufModifiers = epoxy_has_egl_extension(dpy, "EGL_EXT_image_dma_buf_import_modifiers");
++            tex = t;
++            fbo = f;
++            initialized = true;
++            qCInfo(PIPEWIRERECORD_LOGGING) << "NVENC fast DMA-BUF downloader initialized on" << nodePath;
++            return true;
++        }
++        return false;
++    }
++
++    bool download(uint8_t *dst, GLenum readFormat, const PipeWireFrame &frame, const QByteArray &skipRenderNode)
++    {
++        if (!frame.dmabuf || frame.dmabuf->planes.isEmpty()) {
++            return false;
++        }
++        if (!init(skipRenderNode)) {
++            return false;
++        }
++        if (eglGetCurrentContext() != eglContext) {
++            if (!eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, eglContext)) {
++                return false;
++            }
++        }
++
++        const auto &dmabuf = *frame.dmabuf;
++        const uint32_t drmFormat = dmabuf.format ? dmabuf.format : PipeWireSourceStream::spaVideoFormatToDrmFormat(frame.format);
++        bool cached = false;
++        bool cacheHit = false;
++        EGLImageKHR img = importDmaBufEglImage(eglDisplay, hasDmaBufModifiers, imageCache, dmabuf, drmFormat, cached, cacheHit);
++        if (img == EGL_NO_IMAGE_KHR) {
++            return false;
++        }
++
++        glBindTexture(GL_TEXTURE_2D, tex);
++        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
++        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
++
++        const bool complete = (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
++        if (complete) {
++            glPixelStorei(GL_PACK_ALIGNMENT, 4);
++            glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++            glReadPixels(0, 0, dmabuf.width, dmabuf.height, readFormat, GL_UNSIGNED_BYTE, dst);
++        }
++
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        if (!cached) {
++            eglDestroyImageKHR(eglDisplay, img);
++        }
++        return complete;
++    }
++};
++
++struct H264NvencEncoder::Telemetry {
++    std::atomic<uint64_t> filterUs{0};
++    std::atomic<uint64_t> filterCount{0};
++    std::atomic<uint64_t> eglCacheHits{0};
++    std::atomic<uint64_t> eglCacheTotal{0};
++    std::atomic<uint64_t> sendUs{0};
++    std::atomic<uint64_t> sendCount{0};
++
++    // Only touched on the single receivePacket() thread:
++    uint64_t recvUs = 0;
++    uint64_t pktCount = 0;
++    uint64_t keyCount = 0;
++    uint64_t pktBytes = 0;
++    std::chrono::steady_clock::time_point windowStart{};
++};
++
 +struct H264NvencEncoder::GpuState {
++    QByteArray renderNodePath;
 +    int drmFd = -1;
 +    gbm_device *gbmDevice = nullptr;
 +    EGLDisplay eglDisplay = EGL_NO_DISPLAY;
@@ -514,6 +862,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +    QSize srcSize;
 +    QSize codedSize;
++    std::vector<uint8_t> fallbackPixels;
 +    QImage fallbackImage;
 +
 +    std::mutex queueMutex;
@@ -524,6 +873,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +H264NvencEncoder::H264NvencEncoder(H264Profile profile, PipeWireProduce *produce)
 +    : SoftwareEncoder(produce)
 +    , m_profile(profile)
++    , m_stats(std::make_unique<Telemetry>())
 +{
 +}
 +
@@ -539,6 +889,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        av_packet_free(&m_packet);
 +    }
 +
++    m_fastDownloader.reset();
 +    cleanupGpuPath();
 +
 +    if (m_swBufferPool) {
@@ -791,6 +1142,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        }
 +
 +        cudaDeviceIndex = matchedDev;
++        gpu->renderNodePath = nodePath;
 +        gpu->drmFd = fd;
 +        gpu->gbmDevice = gbm;
 +        gpu->eglDisplay = dpy;
@@ -1128,131 +1480,21 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +        if (m_gpu->hasDmaBufImport && !m_gpu->directDmaBufFailed) {
 +            const uint32_t drmFormat = dmabuf.format ? dmabuf.format : PipeWireSourceStream::spaVideoFormatToDrmFormat(frame.format);
-+            const bool useModifier = m_gpu->hasDmaBufModifiers && dmabuf.modifier != DRM_FORMAT_MOD_INVALID;
-+            const int planeCount = std::min<int>(dmabuf.planes.count(), 4);
-+
-+            // Key the EGLImage cache by kernel DMA-BUF identity (dev, ino) plus geometry/layout
-+            // so recycled PipeWire buffers avoid per-frame eglCreateImageKHR/eglDestroyImageKHR.
-+            DmaBufImageKey key;
-+            key.width = dmabuf.width;
-+            key.height = dmabuf.height;
-+            key.drmFormat = drmFormat;
-+            key.modifier = useModifier ? dmabuf.modifier : DRM_FORMAT_MOD_INVALID;
-+            key.planeCount = planeCount;
-+
-+            bool canCache = true;
-+            for (int i = 0; i < planeCount; ++i) {
-+                const auto &plane = dmabuf.planes[i];
-+                struct stat st{};
-+                if (fstat(plane.fd, &st) != 0) {
-+                    canCache = false;
-+                    break;
-+                }
-+                key.planes[i] = {plane.fd, st.st_dev, st.st_ino, plane.offset, plane.stride};
-+            }
-+
-+            if (canCache) {
-+                auto &cache = m_gpu->eglImageCache;
-+                for (auto it = cache.begin(); it != cache.end();) {
-+                    if (it->key == key) {
-+                        eglImage = it->image;
-+                        eglImageCached = true;
-+                        // Promote hit to front (MRU).
-+                        if (it != cache.begin()) {
-+                            std::rotate(cache.begin(), it, it + 1);
-+                        }
-+                        break;
-+                    }
-+                    // Evict any stale entry sharing a recycled fd number with a different inode.
-+                    bool staleFd = false;
-+                    for (int i = 0; i < planeCount && !staleFd; ++i) {
-+                        for (int j = 0; j < it->key.planeCount; ++j) {
-+                            if (it->key.planes[j].fd == key.planes[i].fd
-+                                && (it->key.planes[j].dev != key.planes[i].dev || it->key.planes[j].ino != key.planes[i].ino)) {
-+                                staleFd = true;
-+                                break;
-+                            }
-+                        }
-+                    }
-+                    if (staleFd) {
-+                        eglDestroyImageKHR(m_gpu->eglDisplay, it->image);
-+                        it = cache.erase(it);
-+                    } else {
-+                        ++it;
-+                    }
-+                }
-+            }
-+
-+            if (eglImage == EGL_NO_IMAGE_KHR) {
-+                QVarLengthArray<EGLint, 48> attribs;
-+                attribs.append(EGL_WIDTH);
-+                attribs.append(dmabuf.width);
-+                attribs.append(EGL_HEIGHT);
-+                attribs.append(dmabuf.height);
-+                attribs.append(EGL_LINUX_DRM_FOURCC_EXT);
-+                attribs.append(static_cast<EGLint>(drmFormat));
-+
-+                static constexpr EGLint kFdKeys[4] = {
-+                    EGL_DMA_BUF_PLANE0_FD_EXT,
-+                    EGL_DMA_BUF_PLANE1_FD_EXT,
-+                    EGL_DMA_BUF_PLANE2_FD_EXT,
-+                    EGL_DMA_BUF_PLANE3_FD_EXT,
-+                };
-+                static constexpr EGLint kOffsetKeys[4] = {
-+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-+                    EGL_DMA_BUF_PLANE1_OFFSET_EXT,
-+                    EGL_DMA_BUF_PLANE2_OFFSET_EXT,
-+                    EGL_DMA_BUF_PLANE3_OFFSET_EXT,
-+                };
-+                static constexpr EGLint kPitchKeys[4] = {
-+                    EGL_DMA_BUF_PLANE0_PITCH_EXT,
-+                    EGL_DMA_BUF_PLANE1_PITCH_EXT,
-+                    EGL_DMA_BUF_PLANE2_PITCH_EXT,
-+                    EGL_DMA_BUF_PLANE3_PITCH_EXT,
-+                };
-+                static constexpr EGLint kModLoKeys[4] = {
-+                    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-+                    EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
-+                    EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
-+                    EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
-+                };
-+                static constexpr EGLint kModHiKeys[4] = {
-+                    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-+                    EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
-+                    EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
-+                    EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT,
-+                };
-+
-+                for (int i = 0; i < planeCount; ++i) {
-+                    const auto &plane = dmabuf.planes[i];
-+                    attribs.append(kFdKeys[i]);
-+                    attribs.append(plane.fd);
-+                    attribs.append(kOffsetKeys[i]);
-+                    attribs.append(static_cast<EGLint>(plane.offset));
-+                    attribs.append(kPitchKeys[i]);
-+                    attribs.append(static_cast<EGLint>(plane.stride));
-+                    if (useModifier) {
-+                        attribs.append(kModLoKeys[i]);
-+                        attribs.append(static_cast<EGLint>(dmabuf.modifier & 0xffffffffu));
-+                        attribs.append(kModHiKeys[i]);
-+                        attribs.append(static_cast<EGLint>(dmabuf.modifier >> 32));
-+                    }
-+                }
-+                attribs.append(EGL_NONE);
-+
-+                eglImage = eglCreateImageKHR(m_gpu->eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.constData());
-+                if (eglImage != EGL_NO_IMAGE_KHR && canCache) {
-+                    auto &cache = m_gpu->eglImageCache;
-+                    if (cache.size() >= kMaxCachedEglImages) {
-+                        eglDestroyImageKHR(m_gpu->eglDisplay, cache.back().image);
-+                        cache.pop_back();
-+                    }
-+                    cache.insert(cache.begin(), CachedEglImage{key, eglImage});
-+                    eglImageCached = true;
-+                }
-+            }
-+
++            bool cacheHit = false;
++            eglImage = importDmaBufEglImage(m_gpu->eglDisplay,
++                                            m_gpu->hasDmaBufModifiers,
++                                            m_gpu->eglImageCache,
++                                            dmabuf,
++                                            drmFormat,
++                                            eglImageCached,
++                                            cacheHit);
 +            if (eglImage != EGL_NO_IMAGE_KHR) {
++                if (PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled()) {
++                    m_stats->eglCacheTotal.fetch_add(1, std::memory_order_relaxed);
++                    if (cacheHit) {
++                        m_stats->eglCacheHits.fetch_add(1, std::memory_order_relaxed);
++                    }
++                }
 +                glActiveTexture(GL_TEXTURE0);
 +                glBindTexture(GL_TEXTURE_2D, m_gpu->srcTex);
 +                glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, eglImage);
@@ -1262,28 +1504,49 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +        if (activeSrcTex == 0) {
 +            // Hybrid multi-GPU fallback (e.g. Intel compositor DMA-BUF + NVIDIA NVENC):
-+            // download via session EGL then upload raw RGBA for GPU NV12 conversion.
-+            if (m_gpu->fallbackImage.size() != m_gpu->srcSize) {
-+                m_gpu->fallbackImage = QImage(m_gpu->srcSize, QImage::Format_RGBA8888_Premultiplied);
++            // prefer our non-debug, cached GL_BGRA downloader (avoids R<->B swizzle and
++            // per-frame FBO/texture churn), falling back to DmaBufHandler if needed.
++            if (!m_fastDownloader) {
++                m_fastDownloader = std::make_unique<FastDmaBufDownloader>();
 +            }
-+            if (!m_dmaBufHandler.downloadFrame(m_gpu->fallbackImage, frame)) {
++            const size_t byteCount = static_cast<size_t>(m_gpu->srcSize.width()) * static_cast<size_t>(m_gpu->srcSize.height()) * 4;
++            if (m_gpu->fallbackPixels.size() != byteCount) {
++                m_gpu->fallbackPixels.resize(byteCount);
++            }
++
++            bool downloadedBgra = m_fastDownloader->download(m_gpu->fallbackPixels.data(), GL_BGRA, frame, m_gpu->renderNodePath);
++            bool downloadedRgba = false;
++            if (!downloadedBgra) {
++                if (m_gpu->fallbackImage.size() != m_gpu->srcSize) {
++                    m_gpu->fallbackImage = QImage(m_gpu->srcSize, QImage::Format_RGBA8888_Premultiplied);
++                }
++                downloadedRgba = m_dmaBufHandler.downloadFrame(m_gpu->fallbackImage, frame);
++            }
++            if (!downloadedBgra && !downloadedRgba) {
 +                m_produce->m_stream->renegotiateModifierFailed(frame.format, dmabuf.modifier);
 +                return false;
 +            }
 +            if (!m_gpu->directDmaBufFailed) {
-+                qCWarning(PIPEWIRERECORD_LOGGING)
-+                    << "NVENC direct DMA-BUF EGL import failed (modifier" << Qt::hex << dmabuf.modifier << "), using DmaBufHandler + GPU NV12 fallback";
++                qCWarning(PIPEWIRERECORD_LOGGING) << "NVENC direct DMA-BUF EGL import failed (modifier" << Qt::hex << dmabuf.modifier << "), using"
++                                                  << (downloadedBgra ? "fast BGRA" : "DmaBufHandler") << "+ GPU NV12 fallback";
 +                m_gpu->directDmaBufFailed = true;
 +            }
-+            // DmaBufHandler bound its own EGL context; restore ours before uploading.
++            // The downloader bound its own EGL context; restore ours before uploading.
 +            if (!eglMakeCurrent(m_gpu->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_gpu->eglContext)) {
 +                return false;
 +            }
-+            if (!uploadImageToShmTexture(m_gpu->fallbackImage.constBits(),
-+                                         m_gpu->fallbackImage.width(),
-+                                         m_gpu->fallbackImage.height(),
-+                                         static_cast<int>(m_gpu->fallbackImage.bytesPerLine()),
-+                                         SPA_VIDEO_FORMAT_RGBA)) {
++            const bool uploaded = downloadedBgra
++                ? uploadImageToShmTexture(m_gpu->fallbackPixels.data(),
++                                          m_gpu->srcSize.width(),
++                                          m_gpu->srcSize.height(),
++                                          m_gpu->srcSize.width() * 4,
++                                          SPA_VIDEO_FORMAT_BGRA)
++                : uploadImageToShmTexture(m_gpu->fallbackImage.constBits(),
++                                          m_gpu->fallbackImage.width(),
++                                          m_gpu->fallbackImage.height(),
++                                          static_cast<int>(m_gpu->fallbackImage.bytesPerLine()),
++                                          SPA_VIDEO_FORMAT_RGBA);
++            if (!uploaded) {
 +                return false;
 +            }
 +            activeSrcTex = m_gpu->shmTex;
@@ -1465,8 +1728,15 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +    }
 +
 +    const int stride = size.width() * 4;
-+    QImage wrapped(buf->data, size.width(), size.height(), stride, QImage::Format_RGBA8888_Premultiplied);
-+    if (!m_dmaBufHandler.downloadFrame(wrapped, frame)) {
++    if (!m_fastDownloader) {
++        m_fastDownloader = std::make_unique<FastDmaBufDownloader>();
++    }
++    bool downloaded = m_fastDownloader->download(buf->data, GL_RGBA, frame, QByteArray());
++    if (!downloaded) {
++        QImage wrapped(buf->data, size.width(), size.height(), stride, QImage::Format_RGBA8888_Premultiplied);
++        downloaded = m_dmaBufHandler.downloadFrame(wrapped, frame);
++    }
++    if (!downloaded) {
 +        av_buffer_unref(&buf);
 +        m_produce->m_stream->renegotiateModifierFailed(frame.format, frame.dmabuf->modifier);
 +        return false;
@@ -1500,18 +1770,34 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +bool H264NvencEncoder::filterFrame(const PipeWireFrame &frame)
 +{
-+    if (m_gpu) {
-+        return filterFrameGpu(frame);
++    const bool trackStats = PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled();
++    const auto t0 = trackStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++
++    const bool ok = m_gpu ? filterFrameGpu(frame) : filterFrameSoftware(frame);
++
++    if (trackStats && ok) {
++        const auto dtUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++        m_stats->filterUs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(dtUs, 0)), std::memory_order_relaxed);
++        m_stats->filterCount.fetch_add(1, std::memory_order_relaxed);
 +    }
-+    return filterFrameSoftware(frame);
++    return ok;
 +}
 +
 +std::pair<int, int> H264NvencEncoder::encodeFrame(int maximumFrames)
 +{
 +    if (!m_gpu) {
-+        return SoftwareEncoder::encodeFrame(maximumFrames);
++        const bool trackStats = PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled();
++        const auto t0 = trackStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++        auto res = SoftwareEncoder::encodeFrame(maximumFrames);
++        if (trackStats && res.second > 0) {
++            const auto dtUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++            m_stats->sendUs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(dtUs, 0)), std::memory_order_relaxed);
++            m_stats->sendCount.fetch_add(static_cast<uint64_t>(res.second), std::memory_order_relaxed);
++        }
++        return res;
 +    }
 +
++    const bool trackStats = PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled();
 +    int filtered = 0;
 +    int queued = 0;
 +
@@ -1527,6 +1813,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        }
 +
 +        if (queued < maximumFrames) {
++            const auto t0 = trackStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 +            int ret = -1;
 +            {
 +                std::lock_guard<std::mutex> guard(m_avCodecMutex);
@@ -1537,6 +1824,11 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +                std::lock_guard<std::mutex> lock(m_gpu->queueMutex);
 +                m_gpu->frameQueue.push_front(frame);
 +                break;
++            }
++            if (trackStats && ret == 0) {
++                const auto dtUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++                m_stats->sendUs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(dtUs, 0)), std::memory_order_relaxed);
++                m_stats->sendCount.fetch_add(1, std::memory_order_relaxed);
 +            }
 +            filtered++;
 +            av_frame_unref(frame);
@@ -1577,15 +1869,85 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +    return std::make_pair(filtered, queued);
 +}
 +
++void H264NvencEncoder::maybeLogTelemetry()
++{
++    if (!PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled()) {
++        return;
++    }
++
++    const auto now = std::chrono::steady_clock::now();
++    if (m_stats->windowStart.time_since_epoch().count() == 0) {
++        m_stats->windowStart = now;
++        return;
++    }
++
++    const double elapsedSec = std::chrono::duration<double>(now - m_stats->windowStart).count();
++    if (elapsedSec < 1.0) {
++        return;
++    }
++
++    const uint64_t filterUs = m_stats->filterUs.exchange(0, std::memory_order_relaxed);
++    const uint64_t filterCount = m_stats->filterCount.exchange(0, std::memory_order_relaxed);
++    const uint64_t sendUs = m_stats->sendUs.exchange(0, std::memory_order_relaxed);
++    const uint64_t sendCount = m_stats->sendCount.exchange(0, std::memory_order_relaxed);
++    const uint64_t eglHits = m_stats->eglCacheHits.exchange(0, std::memory_order_relaxed);
++    const uint64_t eglTotal = m_stats->eglCacheTotal.exchange(0, std::memory_order_relaxed);
++
++    const uint64_t pkts = m_stats->pktCount;
++    const uint64_t keys = m_stats->keyCount;
++    const uint64_t bytes = m_stats->pktBytes;
++    const uint64_t recvUs = m_stats->recvUs;
++
++    m_stats->pktCount = 0;
++    m_stats->keyCount = 0;
++    m_stats->pktBytes = 0;
++    m_stats->recvUs = 0;
++    m_stats->windowStart = now;
++
++    const char *mode = "software";
++    if (m_gpu) {
++        if (m_gpu->directDmaBufFailed) {
++            mode = "gpu-hybrid";
++        } else if (m_gpu->useCompute) {
++            mode = "gpu-compute";
++        } else {
++            mode = "gpu-fragment";
++        }
++    }
++
++    const double fps = static_cast<double>(pkts) / elapsedSec;
++    const double filterMs = filterCount ? (static_cast<double>(filterUs) / 1000.0 / static_cast<double>(filterCount)) : 0.0;
++    const double encodeMs = (sendCount ? (static_cast<double>(sendUs) / 1000.0 / static_cast<double>(sendCount)) : 0.0)
++        + (pkts ? (static_cast<double>(recvUs) / 1000.0 / static_cast<double>(pkts)) : 0.0);
++    const double mbps = (static_cast<double>(bytes) * 8.0) / (elapsedSec * 1e6);
++    const double avgKb = pkts ? (static_cast<double>(bytes) / 1024.0 / static_cast<double>(pkts)) : 0.0;
++
++    qCDebug(PIPEWIRERECORDFRAMESTATS_LOGGING,
++            "NVENC[%s %dx%d]: %.1f fps | filter=%.2fms encode=%.2fms | %.2f Mbps (%.1f KB/f, %llu key) | eglCache=%llu/%llu",
++            mode,
++            m_avCodecContext ? m_avCodecContext->width : 0,
++            m_avCodecContext ? m_avCodecContext->height : 0,
++            fps,
++            filterMs,
++            encodeMs,
++            mbps,
++            avgKb,
++            static_cast<unsigned long long>(keys),
++            static_cast<unsigned long long>(eglHits),
++            static_cast<unsigned long long>(eglTotal));
++}
++
 +int H264NvencEncoder::receivePacket()
 +{
 +    if (!m_packet) {
 +        return SoftwareEncoder::receivePacket();
 +    }
 +
++    const bool trackStats = PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled();
 +    int received = 0;
 +
 +    for (;;) {
++        const auto t0 = trackStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 +        int ret = -1;
 +        {
 +            std::lock_guard<std::mutex> guard(m_avCodecMutex);
@@ -1599,10 +1961,24 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +            break;
 +        }
 +
++        if (trackStats) {
++            const auto dtUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++            m_stats->recvUs += static_cast<uint64_t>(std::max<int64_t>(dtUs, 0));
++            m_stats->pktCount++;
++            m_stats->pktBytes += static_cast<uint64_t>(std::max(m_packet->size, 0));
++            if (m_packet->flags & AV_PKT_FLAG_KEY) {
++                m_stats->keyCount++;
++            }
++        }
++
 +        received++;
 +
 +        m_produce->processPacket(m_packet);
 +        av_packet_unref(m_packet);
++    }
++
++    if (trackStats && received > 0) {
++        maybeLogTelemetry();
 +    }
 +
 +    return received;
@@ -1748,7 +2124,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +}
 --- a/src/h264nvencencoder_p.h
 +++ b/src/h264nvencencoder_p.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,64 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 Local patch
 +
@@ -1793,15 +2169,20 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +
 +private:
 +    struct GpuState;
++    struct FastDmaBufDownloader;
++    struct Telemetry;
 +
 +    bool initializeGpuPath(const QSize &size);
 +    void cleanupGpuPath();
 +    bool filterFrameGpu(const PipeWireFrame &frame);
 +    bool filterFrameSoftware(const PipeWireFrame &frame);
 +    bool uploadImageToShmTexture(const void *data, int width, int height, int stride, spa_video_format format);
++    void maybeLogTelemetry();
 +
 +    H264Profile m_profile = H264Profile::Main;
 +    std::unique_ptr<GpuState> m_gpu;
++    std::unique_ptr<FastDmaBufDownloader> m_fastDownloader;
++    std::unique_ptr<Telemetry> m_stats;
 +    AVBufferPool *m_swBufferPool = nullptr;
 +    QSize m_swPoolSize;
 +    AVPacket *m_packet = nullptr;

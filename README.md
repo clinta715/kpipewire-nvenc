@@ -70,6 +70,10 @@ nvidia-smi encodersessions
 Look for `h264_nvenc` in the log and an H.264 session with the KRdp PID
 in the NVIDIA output. The reported FPS is the server-side encode rate.
 
+For per-second stage timings, output bitrate, active path (`gpu-compute`,
+`gpu-fragment`, `gpu-hybrid`, or `software`), and `EGLImage` cache hit rate,
+enable `QT_LOGGING_RULES="kpipewire_record_framestatistics.debug=true"`.
+
 ## Tuning environment variables
 
 All variables are optional and can be exported in `50-nvenc.conf`:
