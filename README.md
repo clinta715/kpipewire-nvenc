@@ -57,6 +57,12 @@ the local library is present and readable and
 KRdp starts with the system library. Port the patch and update the drop-in
 before using it with another KPipeWire version.
 
+The drop-in pins KRdp at quality 70 and disables adaptive quality. This
+resolved lingering blur after screen updates in testing. To change the
+fixed quality, edit the `--quality 70` argument. To restore adaptive quality
+and use the KDE slider, remove both `--static-quality` and `--quality 70`.
+Reload systemd and restart KRdp after either change.
+
 ## Verify hardware encoding
 
 Connect an RDP client and move a window or play a video so there are new
