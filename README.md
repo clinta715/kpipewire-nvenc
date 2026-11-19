@@ -50,9 +50,10 @@ systemctl --user daemon-reload
 systemctl --user restart app-org.kde.krdpserver.service
 ```
 
-The drop-in selects the patched library and forces `h264_nvenc` while
+The drop-in selects the patched library and forces `h264_nvenc` when
+the local library is present and readable and
 `/usr/lib/libKPipeWireRecord.so.6` resolves to
-`/usr/lib/libKPipeWireRecord.so.6.8.3`. If that version check fails,
+`/usr/lib/libKPipeWireRecord.so.6.8.3`. If either check fails,
 KRdp starts with the system library. Port the patch and update the drop-in
 before using it with another KPipeWire version.
 
@@ -73,6 +74,9 @@ in the NVIDIA output. The reported FPS is the server-side encode rate.
 For per-second stage timings, output bitrate, active path (`gpu-compute`,
 `gpu-fragment`, `gpu-hybrid`, or `software`), and `EGLImage` cache hit rate,
 enable `QT_LOGGING_RULES="kpipewire_record_framestatistics.debug=true"`.
+The log includes per-window p95 CPU time in milliseconds for the DMA-BUF fence
+wait and the CUDA map and unmap calls. A value of `-1.000` means the window had
+no samples for that stage. The CUDA timings measure host call duration.
 
 ## Tuning environment variables
 

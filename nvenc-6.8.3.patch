@@ -39,7 +39,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
                              libvpxencoder.cpp
 --- a/src/h264nvencencoder.cpp
 +++ b/src/h264nvencencoder.cpp
-@@ -0,0 +1,2082 @@
+@@ -0,0 +1,2141 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 Local patch
 +
@@ -783,6 +783,9 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +            return false;
 +        }
 +
++        // Clear earlier errors so the result describes this download.
++        while (glGetError() != GL_NO_ERROR) {
++        }
 +        glBindTexture(GL_TEXTURE_2D, tex);
 +        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
 +        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -799,7 +802,7 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        if (!cached) {
 +            eglDestroyImageKHR(eglDisplay, img);
 +        }
-+        return complete;
++        return glGetError() == GL_NO_ERROR && complete;
 +    }
 +};
 +
@@ -810,6 +813,10 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +    std::atomic<uint64_t> eglCacheTotal{0};
 +    std::atomic<uint64_t> sendUs{0};
 +    std::atomic<uint64_t> sendCount{0};
++    std::mutex gpuTimingMutex;
++    std::vector<double> fenceWaitMs;
++    std::vector<double> cudaMapMs;
++    std::vector<double> cudaUnmapMs;
 +
 +    // Only touched on the single receivePacket() thread:
 +    uint64_t recvUs = 0;
@@ -1616,14 +1623,26 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 +    }
 +
++    using Clock = std::chrono::steady_clock;
++    const bool trackGpuTiming = PIPEWIRERECORDFRAMESTATS_LOGGING().isDebugEnabled();
++    const auto timingStart = [trackGpuTiming] {
++        return trackGpuTiming ? Clock::now() : Clock::time_point{};
++    };
++    const auto elapsedMs = [trackGpuTiming](Clock::time_point start) {
++        return trackGpuTiming ? std::chrono::duration<double, std::milli>(Clock::now() - start).count() : 0.0;
++    };
++    double fenceWaitMs = 0.0;
 +    if (eglImage != EGL_NO_IMAGE_KHR) {
 +        // Ensure GL has finished sampling the PipeWire DMA-BUF before returning it.
 +        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-+        if (fence) {
-+            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
-+            glDeleteSync(fence);
-+        } else {
++        const auto waitStart = timingStart();
++        const GLenum waitResult = fence ? glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL) : GL_WAIT_FAILED;
++        if (waitResult != GL_ALREADY_SIGNALED && waitResult != GL_CONDITION_SATISFIED) {
 +            glFinish();
++        }
++        fenceWaitMs = elapsedMs(waitStart);
++        if (fence) {
++            glDeleteSync(fence);
 +        }
 +        if (!eglImageCached) {
 +            eglDestroyImageKHR(m_gpu->eglDisplay, eglImage);
@@ -1666,9 +1685,14 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +    auto *cuCtx = reinterpret_cast<AvCudaDeviceContext *>(devCtx->hwctx);
 +
 +    bool copyOk = false;
++    double cudaMapMs = 0.0;
++    double cudaUnmapMs = 0.0;
 +    if (cuda.ctxPushCurrent(cuCtx->cuda_ctx) == kCudaSuccess) {
 +        CUgraphicsResource resources[2] = {m_gpu->yCudaRes, m_gpu->uvCudaRes};
-+        if (cuda.graphicsMapResources(2, resources, cuCtx->stream) == kCudaSuccess) {
++        const auto mapStart = timingStart();
++        const CUresult mapResult = cuda.graphicsMapResources(2, resources, cuCtx->stream);
++        cudaMapMs = elapsedMs(mapStart);
++        if (mapResult == kCudaSuccess) {
 +            CUarray yArr = nullptr;
 +            CUarray uvArr = nullptr;
 +            if (cuda.graphicsSubResourceGetMappedArray(&yArr, m_gpu->yCudaRes, 0, 0) == kCudaSuccess
@@ -1694,7 +1718,9 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +                copyOk = (cuda.memcpy2DAsync(&cpY, cuCtx->stream) == kCudaSuccess)
 +                    && (cuda.memcpy2DAsync(&cpUV, cuCtx->stream) == kCudaSuccess);
 +            }
++            const auto unmapStart = timingStart();
 +            cuda.graphicsUnmapResources(2, resources, cuCtx->stream);
++            cudaUnmapMs = elapsedMs(unmapStart);
 +        }
 +        CUcontext popped = nullptr;
 +        cuda.ctxPopCurrent(&popped);
@@ -1706,6 +1732,17 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +        return false;
 +    }
 +
++    if (trackGpuTiming) {
++        std::lock_guard<std::mutex> lock(m_stats->gpuTimingMutex);
++        // Bound samples if packet reception stalls and the reporting window stays open.
++        if (m_stats->cudaMapMs.size() < 1024) {
++            if (eglImage != EGL_NO_IMAGE_KHR) {
++                m_stats->fenceWaitMs.push_back(fenceWaitMs);
++            }
++            m_stats->cudaMapMs.push_back(cudaMapMs);
++            m_stats->cudaUnmapMs.push_back(cudaUnmapMs);
++        }
++    }
 +    {
 +        std::lock_guard<std::mutex> lock(m_gpu->queueMutex);
 +        m_gpu->frameQueue.push_back(cudaFrame);
@@ -1893,6 +1930,24 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +    const uint64_t eglHits = m_stats->eglCacheHits.exchange(0, std::memory_order_relaxed);
 +    const uint64_t eglTotal = m_stats->eglCacheTotal.exchange(0, std::memory_order_relaxed);
 +
++    std::vector<double> fenceWaitMs;
++    std::vector<double> cudaMapMs;
++    std::vector<double> cudaUnmapMs;
++    {
++        std::lock_guard<std::mutex> lock(m_stats->gpuTimingMutex);
++        fenceWaitMs.swap(m_stats->fenceWaitMs);
++        cudaMapMs.swap(m_stats->cudaMapMs);
++        cudaUnmapMs.swap(m_stats->cudaUnmapMs);
++    }
++    const auto p95 = [](std::vector<double> &samples) {
++        if (samples.empty()) {
++            return -1.0;
++        }
++        auto rank = samples.begin() + (samples.size() * 95 - 1) / 100;
++        std::nth_element(samples.begin(), rank, samples.end());
++        return *rank;
++    };
++
 +    const uint64_t pkts = m_stats->pktCount;
 +    const uint64_t keys = m_stats->keyCount;
 +    const uint64_t bytes = m_stats->pktBytes;
@@ -1923,7 +1978,8 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +    const double avgKb = pkts ? (static_cast<double>(bytes) / 1024.0 / static_cast<double>(pkts)) : 0.0;
 +
 +    qCDebug(PIPEWIRERECORDFRAMESTATS_LOGGING,
-+            "NVENC[%s %dx%d]: %.1f fps | filter=%.2fms encode=%.2fms | %.2f Mbps (%.1f KB/f, %llu key) | eglCache=%llu/%llu",
++            "NVENC[%s %dx%d]: %.1f fps | filter=%.2fms encode=%.2fms | %.2f Mbps (%.1f KB/f, %llu key) | eglCache=%llu/%llu"
++            " | p95 CPU ms fence=%.3f cudaMap=%.3f cudaUnmap=%.3f",
 +            mode,
 +            m_avCodecContext ? m_avCodecContext->width : 0,
 +            m_avCodecContext ? m_avCodecContext->height : 0,
@@ -1934,7 +1990,10 @@ Tried before the VAAPI path; force with KPIPEWIRE_FORCE_ENCODER=h264_nvenc.
 +            avgKb,
 +            static_cast<unsigned long long>(keys),
 +            static_cast<unsigned long long>(eglHits),
-+            static_cast<unsigned long long>(eglTotal));
++            static_cast<unsigned long long>(eglTotal),
++            p95(fenceWaitMs),
++            p95(cudaMapMs),
++            p95(cudaUnmapMs));
 +}
 +
 +int H264NvencEncoder::receivePacket()
